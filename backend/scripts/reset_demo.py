@@ -1,13 +1,18 @@
 """
-Demo reset script — run this between demo sessions.
+Demo reset script — run this before EVERY demo session.
 
 What it does:
   1. Clears ALL GDS tables (experiments, staging, users, audit, plans)
   2. Wipes ABASE and re-seeds 20 scientists + 80 wells from seed_abase_v2.sql
+  3. Verifies final counts so you can confirm state is clean before starting
 
 Usage:
   cd backend
   python scripts/reset_demo.py
+
+Expected output:
+  ABASE → 20 scientists, 80 wells  (8 with flagged outlier wells)
+  GDS   → 0 users, 0 experiments, 0 staging rows
 """
 import asyncio
 import os
@@ -43,12 +48,18 @@ async def reset_gds(conn: asyncpg.Connection) -> None:
         TRUNCATE
             migration_audit_log,
             migration_plans,
+            migration_jobs,
+            migration_mappings,
             gds_staging_experiments,
             gds_experiments,
             gds_users
         RESTART IDENTITY CASCADE
     """)
-    print("  GDS cleared.")
+    # Verify the truncate actually took effect
+    remaining = await conn.fetchval("SELECT COUNT(*) FROM gds_users")
+    if remaining != 0:
+        raise RuntimeError(f"GDS TRUNCATE failed — gds_users still has {remaining} rows.")
+    print("  GDS cleared. ✓")
 
 
 async def reset_abase(conn: asyncpg.Connection) -> None:
@@ -67,7 +78,34 @@ async def reset_abase(conn: asyncpg.Connection) -> None:
 
     user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
     well_count = await conn.fetchval("SELECT COUNT(*) FROM experiments")
-    print(f"  ABASE seeded: {user_count} scientists, {well_count} wells.")
+
+    if user_count != 20 or well_count != 80:
+        raise RuntimeError(
+            f"ABASE seed failed — expected 20 scientists / 80 wells, "
+            f"got {user_count} / {well_count}."
+        )
+    print(f"  ABASE seeded: {user_count} scientists, {well_count} wells. ✓")
+
+
+async def verify(gds_conn: asyncpg.Connection, abase_conn: asyncpg.Connection) -> None:
+    abase_users = await abase_conn.fetchval("SELECT COUNT(*) FROM users")
+    abase_wells = await abase_conn.fetchval("SELECT COUNT(*) FROM experiments")
+    gds_users   = await gds_conn.fetchval("SELECT COUNT(*) FROM gds_users")
+    gds_exps    = await gds_conn.fetchval("SELECT COUNT(*) FROM gds_experiments")
+    staging     = await gds_conn.fetchval("SELECT COUNT(*) FROM gds_staging_experiments")
+
+    print("\n── Final State ─────────────────────────────")
+    print(f"  ABASE → {abase_users} scientists, {abase_wells} wells")
+    print(f"  GDS   → {gds_users} users, {gds_exps} experiments, {staging} staging rows")
+
+    ok = (abase_users == 20 and abase_wells == 80
+          and gds_users == 0 and gds_exps == 0 and staging == 0)
+    if ok:
+        print("  Status: READY FOR DEMO ✓")
+    else:
+        print("  Status: WARNING — unexpected counts, do not start demo.")
+        sys.exit(1)
+    print("────────────────────────────────────────────\n")
 
 
 async def main() -> None:
@@ -81,6 +119,9 @@ async def main() -> None:
     gds_conn = await asyncpg.connect(**_parse(GDS_URL), ssl="require", statement_cache_size=0)
     try:
         await reset_gds(gds_conn)
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        sys.exit(1)
     finally:
         await gds_conn.close()
 
@@ -88,10 +129,20 @@ async def main() -> None:
     abase_conn = await asyncpg.connect(**_parse(ABASE_URL), ssl="require", statement_cache_size=0)
     try:
         await reset_abase(abase_conn)
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        sys.exit(1)
     finally:
         await abase_conn.close()
 
-    print("\nDone. Ready for next demo run.\n")
+    # Final verification using fresh connections
+    gds_conn   = await asyncpg.connect(**_parse(GDS_URL),   ssl="require", statement_cache_size=0)
+    abase_conn = await asyncpg.connect(**_parse(ABASE_URL), ssl="require", statement_cache_size=0)
+    try:
+        await verify(gds_conn, abase_conn)
+    finally:
+        await gds_conn.close()
+        await abase_conn.close()
 
 
 if __name__ == "__main__":

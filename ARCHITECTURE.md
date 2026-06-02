@@ -21,7 +21,93 @@ This document describes how the Migration Agent platform is designed and why.
 
 ---
 
-## 2. Component taxonomy
+## 2. End-to-end workflow
+
+Top to bottom. The label in each box says **who** acts — the AI proposes (read-only), deterministic
+code performs every write, and humans handle only the uncertain rows.
+
+```
+   LEGEND:  🟢 AI agent (read-only)   ⚪ Deterministic code (the only writer)
+            🟡 Single LLM call        👤 Human
+
+┌────────────────────────────────────────────────────────────────────────┐
+│  SOURCE DB (ABASE)                          TARGET DB (GDS)              │
+│  • users / experiments                      • staging (transient)        │
+│                                             • production (immutable)     │
+└────────────────────────────────────────────────────────────────────────┘
+        │ read-only                                        ▲ all writes
+        ▼                                                  │ happen here
+┌────────────────────────────────────────────────────────────────────────┐
+│  1.  TRIGGER                                                    ⚪        │
+│      POST /api/agent/run   →   assign trace_id                           │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  2.  MIGRATION AGENT                                            🟢        │
+│      discover schemas ─▶ sample rows ─▶ write+test pandas ─▶ classify    │
+│      (information_schema)            (self-repair on error)   (mean ± 2σ) │
+│                                                                          │
+│      OUTPUT:  cleaned_records  +  promotion_config (JSON plan)           │
+│      ── no database writes in this box ──                                │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  3.  WRITE TO STAGING                                          ⚪        │
+│      all rows → gds_staging_experiments  (status = pending)              │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  4.  MARK SOURCE 'migrating'   +   STORE PLAN                  ⚪        │
+│      ABASE users.migration_status = 'migrating'  (NO delete yet)         │
+│      promotion_config → migration_plans                                  │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  5.  MAPPING CRITIC                                            🟡        │
+│      audits the mapping  →  verdict: APPROVE  or  FLAG                   │
+└───────────────┬───────────────────────────────────┬──────────────────────┘
+                │ FLAG                                │ APPROVE
+                ▼                                     ▼
+┌──────────────────────────────┐      ┌──────────────────────────────────┐
+│  5a. FORCE ALL → review   ⚪ │      │  6.  SPLIT BY risk_level      ⚪  │
+│      (auto-promote skipped)  │      │                                   │
+└──────────────┬───────────────┘      │   auto ───────▶ AUTO-PROMOTE      │
+               │                       │                 → production      │
+               │                       │                                   │
+               └───────────────────────┤   review ─────▶ HOLD in staging   │
+                                        └──────────────┬────────────────────┘
+                                                       ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  7.  HUMAN REVIEW  (only the flagged / uncertain rows)        👤        │
+│      approve / exclude / reject     [+ Review Resolution Agent 🟢]       │
+│      approved → production                                               │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  8.  POST-COMMIT CLEANUP                                       ⚪        │
+│      hard-delete source ONLY for scientists fully live in GDS           │
+│      (everyone else stays 'migrating' until resolved)                    │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  9.  VERIFICATION AGENT                                        🟢        │
+│      recompute thresholds · reconcile staged = live + removed + pending  │
+│      compare staging vs production values                                │
+│                                                                          │
+│      REPORT:  Overall PASS   or   NEEDS REVIEW                          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Three properties the diagram makes explicit:
+1. **The only AI that touches the data (box 2) is read-only.** Everything that *writes* (boxes 3,
+   4, 6, 8) is deterministic code — that is the trust boundary.
+2. **The plan flows down, not the AI.** Box 2 emits `promotion_config`; every box below executes it.
+3. **Two safety gates + an independent auditor:** the Critic can divert everything to humans, humans
+   handle only the uncertain rows, and a separate agent grades the result.
+
+---
+
+## 3. Component taxonomy
 
 The word "agent" is used precisely. There are three categories:
 
@@ -45,7 +131,7 @@ One LLM call, no loop, no tools.
 ### ⚪ Deterministic code — no LLM
 | Area | File(s) |
 |---|---|
-| Orchestration | `app/api/agent.py` (fixed pipeline; not an orchestrator agent — see §7) |
+| Orchestration | `app/api/agent.py` (fixed pipeline; not an orchestrator agent — see §8) |
 | Writes & promotion | `app/api/migration.py` (`_promote_rows`, approve/reject, upsert-key guard, audit log) |
 | Read APIs | `app/api/abase.py`, `app/api/gds.py`, `app/api/report.py`, `app/api/reviewer.py`, `app/api/critic.py` |
 | Plumbing | `app/connectors/*` (pools), `app/core/llm.py` (Gemini client + failover), `app/core/mapping.py` (validation, coercion, config loader) |
@@ -54,7 +140,7 @@ One LLM call, no loop, no tools.
 
 ---
 
-## 3. Dual-database setup
+## 4. Dual-database setup
 
 - **Source (ABASE):** legacy system — `users`, `experiments`.
 - **Target (GDS):**
@@ -70,7 +156,7 @@ lifespan.
 
 ---
 
-## 4. The `promotion_config` contract
+## 5. The `promotion_config` contract
 
 The Migration Agent emits this JSON; the promotion code consumes it. Example shape:
 
@@ -91,9 +177,15 @@ The Migration Agent emits this JSON; the promotion code consumes it. Example sha
   validates the proposed `ON CONFLICT` columns against the table's *actual* unique/PK constraints
   and falls back to the real one. **Agent proposes, infrastructure guarantees.**
 
+> **Supabase note:** `_resolve_conflict_target` queries `pg_constraint` / `pg_class` / `pg_attribute`
+> rather than `information_schema.key_column_usage`. The `information_schema` view returns empty rows
+> on Supabase's pgBouncer pooler sessions (session-scoped visibility), which caused a silent fallback
+> to unvalidated ON CONFLICT keys and a PostgreSQL `InvalidColumnReferenceError` on HITL approve.
+> `pg_catalog` is always accessible and is the correct choice for DDL introspection on Supabase.
+
 ---
 
-## 5. Anomaly screening (statistical, dynamic)
+## 6. Anomaly screening (statistical, dynamic)
 
 The Migration Agent computes thresholds from the actual sampled data — nothing hardcoded:
 
@@ -111,22 +203,24 @@ classification to the Migration Agent's — one agent auditing another.
 
 ---
 
-## 6. Human-in-the-loop (HITL)
+## 7. Human-in-the-loop (HITL)
 
-- **Auto records** (`risk_level='auto'`) → promoted to production immediately, no human needed.
+- **Auto records** (`risk_level='auto'`) → promoted to production immediately, no human needed,
+  unless the Mapping Critic flags the run (see Gate 1), in which case every record is forced to `review`.
 - **Review records** (`risk_level='review'`) → held in staging; a human approves, excludes, or
   rejects them (directly, or via the Review Resolution Agent acting on a researcher's message).
 
 Every resolution writes an attributed event (`hitl_approved` / `hitl_excluded` / `hitl_rejected`,
 with the actor) to `migration_audit_log`, so the verification report can show who did what, when.
 
-A second, deferred gate (**Gate 1 — mapping review**) surfaces the *draft mapping* to a human
-before any data moves; it is intended for unknown source schemas. Trusted pipelines like ABASE → GDS
-proceed directly. The Mapping Critic already produces the verdict that backs this gate.
+A second gate (**Gate 1 — mapping review**) surfaces the *draft mapping* for human review, backed by
+the Mapping Critic's verdict: on `APPROVE` the pipeline auto-promotes clean records; on `FLAG`
+auto-promotion is skipped and every record is forced into HITL. A critic *failure* (LLM unavailable)
+is non-blocking, but a `FLAG` *verdict* is enforced.
 
 ---
 
-## 7. Orchestration (and why it isn't an agent — yet)
+## 8. Orchestration (and why it isn't an agent — yet)
 
 The end-to-end flow in `app/api/agent.py` is a **deterministic, linear pipeline**, not an
 orchestrator agent. This is intentional: for a known pipeline (ABASE → GDS) the sequence is fixed,
@@ -136,7 +230,7 @@ documented v2 direction.
 
 ---
 
-## 8. Resilience
+## 9. Resilience
 
 `app/core/llm.py` wraps every Gemini call with **model failover**: on a transient error (429/503/
 overload) it retries on the next model in the chain (`gemini-2.5-flash` → `gemini-2.0-flash` →
@@ -145,7 +239,7 @@ model is surfaced immediately rather than masked.
 
 ---
 
-## 9. Traceability
+## 10. Traceability
 
 Every run has a UUID `trace_id` that flows through: the agent run → staging rows → `migration_plans`
 → `migration_audit_log` → HITL decisions → the verification report. Use it to audit, inspect, or
@@ -153,7 +247,7 @@ roll back a single migration.
 
 ---
 
-## 10. Tech stack
+## 11. Tech stack
 
 | Layer | Technology |
 |---|---|

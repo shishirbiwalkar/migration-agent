@@ -103,11 +103,32 @@ mapping. You judge it.
 You receive:
 - promotion_config: the proposed mapping (entity_table + records_table column_maps, upsert keys)
 - target_schema: the actual columns + types of the target tables
+- auto_filled_columns: columns managed by the infrastructure, NOT mapped from source
 - sample_staged_rows: real values for the intermediate columns being mapped
+
+INFRASTRUCTURE-MANAGED COLUMNS — READ THIS FIRST:
+Columns listed in `auto_filled_columns` are populated and linked entirely by the deterministic
+promotion infrastructure — they are NEVER written from incoming source values. In particular:
+  - A primary/foreign key that is a generated UUID (a UUID column with a DB default): the infra
+    INSERTs the entity, lets the database generate the UUID, then uses that generated UUID as the
+    foreign key on the child record. Source values are never cast into it.
+  - trace_id, approved_by, and any column with a DB default.
+Therefore, for ANY column in `auto_filled_columns`, do NOT raise a type-mismatch, semantic-mismatch,
+missing-mapping, or upsert-key finding. A source field that merely shares its name (e.g. an integer
+`gds_user_id` present in the staged data) is NOT evidence of a bad mapping — the infra does not write
+it into that column. Treating an auto-generated UUID PK/FK as an "integer → UUID type mismatch" is a
+FALSE POSITIVE and must not be reported.
+
+UPSERT KEYS are validated and auto-corrected by the infrastructure against the target table's real
+UNIQUE / PRIMARY KEY constraints before use: a proposed key that does not match a real constraint is
+transparently replaced with one that does. So an imperfect upsert-key proposal is at most an "info"
+note — never an "error" or "warning".
 
 CHECK FOR (reason from the data, do not just pattern-match names):
 1. TYPE MISMATCH — a value mapped into a target column of an incompatible type
    (e.g. a text ID written into a numeric/double column, a string into a timestamp).
+   This applies ONLY to columns actually mapped from source data — NEVER to
+   `auto_filled_columns` (see the infrastructure-managed rule above).
 2. SEMANTIC MISMATCH — a mapping where the source meaning clearly does not match the
    target column (e.g. an identifier mapped into a measurement/signal column).
 3. MISSING MAPPING — a target column that has an obvious source equivalent in the
@@ -117,7 +138,8 @@ CHECK FOR (reason from the data, do not just pattern-match names):
    flag an auto_filled column as a missing mapping — that is expected and correct.
 4. UNIT / SCALE RISK — names or values suggesting a unit difference
    (e.g. concentration_um vs concentration — confirm no conversion is silently lost).
-5. UPSERT KEY SANITY — is the chosen upsert key plausibly unique for the entity/record?
+5. UPSERT KEY SANITY — only an "info" note at most (the infra auto-corrects upsert keys
+   against real constraints; never flag this as error/warning, and never for auto_filled columns).
 
 For each issue, assign severity:
 - "error"   = will corrupt data or break promotion (e.g. type mismatch)

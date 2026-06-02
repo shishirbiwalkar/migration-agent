@@ -37,6 +37,7 @@ import asyncpg
 import logging
 import traceback
 import urllib.parse
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -77,6 +78,7 @@ class _RunState:
     source_tables:     dict[str, pd.DataFrame]        = field(default_factory=dict)
     cleaned_df:        pd.DataFrame | None            = None
     promotion_config:  dict                           = field(default_factory=dict)
+    transform_script:  str | None                     = None   # captured for cache/replay
 
 
 # ── Shared schema reader ──────────────────────────────────────────────────────
@@ -193,62 +195,73 @@ async def _tool_sample_source_data(
 
 # ── Tool 4: write_and_test_mapping (IN-MEMORY, no DB writes) ─────────────────
 
-async def _tool_write_and_test_mapping(
-    script: str, state: _RunState
-) -> dict:
-    # Load all source tables into memory (READ ONLY from source DB)
-    if not state.source_tables:
-        async with state.source_pool.acquire() as conn:
-            tnames = await conn.fetch("""
-                SELECT table_name FROM information_schema.tables
-                WHERE  table_schema='public' AND table_type='BASE TABLE'
-            """)
-        for t in tnames:
-            async with state.source_pool.acquire() as conn:
-                rows = await conn.fetch(f'SELECT * FROM "{t["table_name"]}"')
+def _safe_cell(v: Any) -> Any:
+    """JSON/DataFrame-safe scalar coercion for values read from the source DB."""
+    if isinstance(v, uuid.UUID): return str(v)
+    if hasattr(v, "isoformat"):  return v.isoformat()
+    return v
 
-            def _safe(v):
-                if isinstance(v, uuid.UUID): return str(v)
-                if hasattr(v, "isoformat"):  return v.isoformat()
-                return v
 
-            state.source_tables[t["table_name"]] = pd.DataFrame(
-                [{k: _safe(v) for k, v in dict(r).items()} for r in rows]
-            )
+async def _load_source_tables(source_pool: asyncpg.Pool) -> dict[str, pd.DataFrame]:
+    """Read every source table fully into memory as DataFrames (READ ONLY)."""
+    tables: dict[str, pd.DataFrame] = {}
+    async with source_pool.acquire() as conn:
+        tnames = await conn.fetch("""
+            SELECT table_name FROM information_schema.tables
+            WHERE  table_schema='public' AND table_type='BASE TABLE'
+        """)
+    for t in tnames:
+        async with source_pool.acquire() as conn:
+            rows = await conn.fetch(f'SELECT * FROM "{t["table_name"]}"')
+        tables[t["table_name"]] = pd.DataFrame(
+            [{k: _safe_cell(v) for k, v in dict(r).items()} for r in rows]
+        )
+    return tables
 
-    # Execute transformation in-memory — no DB connection in namespace
-    namespace = {
-        name: df.copy() for name, df in state.source_tables.items()
-    }
+
+def _execute_pandas_transform(source_tables: dict[str, pd.DataFrame], script: str) -> pd.DataFrame:
+    """
+    Execute a pandas transform script against source tables, in-memory, no DB connection.
+    Shared by the agent's write_and_test tool and the deterministic cache-replay path.
+    Raises ValueError on any contract violation; the caller decides how to surface it.
+    """
+    namespace = {name: df.copy() for name, df in source_tables.items()}
     namespace["pd"] = pd
     namespace["np"] = np   # for statistical threshold computation
 
+    exec(script, namespace)  # noqa: S102
+
+    result = namespace.get("result")
+    if result is None:
+        raise ValueError("Script must assign the output to a variable named `result`.")
+    if not isinstance(result, pd.DataFrame):
+        raise ValueError(f"`result` must be a DataFrame, got {type(result).__name__}.")
+    if result.empty:
+        raise ValueError("`result` is empty. Check JOIN/filter logic.")
+
+    if "risk_level" not in result.columns:
+        result["risk_level"] = "auto"
+
+    before = len(result)
+    result = result.dropna(subset=[c for c in result.columns if c != "risk_level"]).copy()
+    dropped = before - len(result)
+    if dropped:
+        logger.warning("dropna removed %d rows — nullable columns likely included in result.", dropped)
+    return result
+
+
+async def _tool_write_and_test_mapping(
+    script: str, state: _RunState
+) -> dict:
+    # Load all source tables into memory once (READ ONLY from source DB)
+    if not state.source_tables:
+        state.source_tables = await _load_source_tables(state.source_pool)
+
     try:
-        exec(script, namespace)  # noqa: S102
-
-        result = namespace.get("result")
-        if result is None:
-            return {"status": "error",
-                    "error":  "Script must assign the output to a variable named `result`."}
-        if not isinstance(result, pd.DataFrame):
-            return {"status": "error",
-                    "error":  f"`result` must be a DataFrame, got {type(result).__name__}."}
-        if result.empty:
-            return {"status": "error", "error": "`result` is empty. Check JOIN/filter logic."}
-
-        # Ensure risk_level column exists (agent should set this)
-        if "risk_level" not in result.columns:
-            result["risk_level"] = "auto"
-
-        before = len(result)
-        result = result.dropna(subset=[c for c in result.columns
-                                       if c not in ("risk_level",)]).copy()
-        dropped = before - len(result)
-        if dropped:
-            logger.warning("dropna removed %d rows — likely nullable columns included in result. "
-                           "Agent script should only select columns needed for target.", dropped)
+        result = _execute_pandas_transform(state.source_tables, script)
 
         state.cleaned_df = result
+        state.transform_script = script   # capture for the reusable mapping cache
 
         # Anomaly summary
         anomalies = result[result["risk_level"] == "review"].shape[0]
@@ -664,38 +677,111 @@ async def run_migration_agent(
         raise RuntimeError(
             f"Agent did not complete mapping ({reason}). Check reasoning_trace.")
 
-    # Build cleaned records list
-    cleaned_records = state.cleaned_df.to_dict(orient="records")
+    return _build_result(
+        trace_id, state.cleaned_df, state.source_tables, state.promotion_config,
+        transform_script=state.transform_script, reasoning_trace=trace,
+        turns_used=turns_used, mapping_source="agent",
+    )
 
-    # Extract unique users for summary
+
+# ── Result builder + mapping reuse (cache / replay) ───────────────────────────
+
+def _build_result(
+    trace_id: str, cleaned_df: pd.DataFrame, source_tables: dict[str, pd.DataFrame],
+    promotion_config: dict, *, transform_script: str | None,
+    reasoning_trace: list, turns_used: int, mapping_source: str,
+) -> dict:
+    """Shared result shape for both the agent run and the deterministic replay."""
+    cleaned_records = cleaned_df.to_dict(orient="records")
+
     unique_users: list[dict] = []
-    if "scientist_name" in state.cleaned_df.columns:
-        role_col = "scientist_role" if "scientist_role" in state.cleaned_df.columns else None
+    if "scientist_name" in cleaned_df.columns:
+        role_col = "scientist_role" if "scientist_role" in cleaned_df.columns else None
         if role_col:
             unique_users = (
-                state.cleaned_df.groupby("scientist_name")[role_col]
+                cleaned_df.groupby("scientist_name")[role_col]
                 .first().reset_index()
                 .rename(columns={"scientist_name": "name", role_col: "role"})
                 .to_dict(orient="records")
             )
 
-    # Source row count
-    source_count = sum(len(df) for df in state.source_tables.values())
+    source_count = sum(len(df) for df in source_tables.values())
 
     return {
         "trace_id":         trace_id,
         "source_row_count": source_count,
         "staged_row_count": len(cleaned_records),
         "cleaned_records":  cleaned_records,
-        "promotion_config": state.promotion_config,
+        "promotion_config": promotion_config,
+        "transform_script": transform_script,
+        "mapping_source":   mapping_source,          # "agent" (LLM ran) | "cache" (replayed)
         "unique_users":     unique_users,
         "quality_verdict":  "WARN" if any(
             r.get("risk_level") == "review" for r in cleaned_records
         ) else "PASS",
         "schema_mapping":   {
-            k: v for k, v in state.promotion_config.items()
+            k: v for k, v in promotion_config.items()
             if k not in ("anomaly_thresholds",)
         },
-        "reasoning_trace":  trace,
+        "reasoning_trace":  reasoning_trace,
         "turns_used":       turns_used,
     }
+
+
+async def _schema_fingerprint(pool: asyncpg.Pool) -> str:
+    """Stable hash of a database's shape (tables, columns, types). Order-independent."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT table_name, column_name, data_type
+            FROM   information_schema.columns
+            WHERE  table_schema = 'public'
+            ORDER  BY table_name, ordinal_position
+        """)
+    payload = [[r["table_name"], r["column_name"], r["data_type"]] for r in rows]
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]
+
+
+async def compute_schema_fingerprints(source_url: str, target_url: str) -> dict:
+    """
+    Fingerprint the (source, target) schema pair. A cached mapping is reusable only
+    while this combined fingerprint is unchanged — a new column or type change busts it.
+    """
+    sp = await _create_pool(source_url)
+    try:
+        tp = await _create_pool(target_url)
+    except Exception:
+        await sp.close()
+        raise
+    try:
+        src = await _schema_fingerprint(sp)
+        tgt = await _schema_fingerprint(tp)
+    finally:
+        await sp.close()
+        await tp.close()
+    combined = hashlib.sha256(f"{src}:{tgt}".encode()).hexdigest()[:16]
+    return {"combined": combined, "source": src, "target": tgt}
+
+
+async def replay_mapping(
+    trace_id: str, source_url: str, transform_script: str, promotion_config: dict,
+) -> dict:
+    """
+    Deterministic replay of a cached mapping — NO LLM, NO agent loop. Loads source data,
+    re-executes the cached transform (which recomputes anomaly thresholds on the new data),
+    and returns the same result shape the agent would have. Read-only, like the agent.
+    """
+    sp = await _create_pool(source_url)
+    try:
+        source_tables = await _load_source_tables(sp)
+    finally:
+        await sp.close()
+
+    cleaned_df = _execute_pandas_transform(source_tables, transform_script)
+    return _build_result(
+        trace_id, cleaned_df, source_tables, promotion_config,
+        transform_script=transform_script,
+        reasoning_trace=[{"action": "CACHE_REPLAY",
+                          "message": "Reused a cached mapping for this schema pair; "
+                                     "agent/LLM skipped. Transform re-run on current data."}],
+        turns_used=0, mapping_source="cache",
+    )

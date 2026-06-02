@@ -70,3 +70,36 @@ CREATE TABLE IF NOT EXISTS migration_audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_trace_id ON migration_audit_log (trace_id);
 CREATE INDEX IF NOT EXISTS idx_audit_event    ON migration_audit_log (event);
+
+-- ============================================================
+-- Mapping reuse / cache  — learned mappings, replayed deterministically
+-- Keyed by a fingerprint of the (source, target) schema pair. A cache hit lets
+-- the pipeline skip the LLM/agent entirely and replay the stored transform.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS migration_mappings (
+    schema_fingerprint TEXT        PRIMARY KEY,   -- hash(source_fp : target_fp)
+    source_fingerprint TEXT        NOT NULL,
+    target_fingerprint TEXT        NOT NULL,
+    transform_script   TEXT        NOT NULL,       -- the pandas transform to replay
+    promotion_config   JSONB       NOT NULL,
+    derived_trace_id   UUID,                        -- the run that first learned this mapping
+    hit_count          INTEGER     NOT NULL DEFAULT 0,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at       TIMESTAMPTZ
+);
+
+-- ============================================================
+-- Async job tracking — background migration runs + status polling
+-- ============================================================
+CREATE TABLE IF NOT EXISTS migration_jobs (
+    trace_id       UUID        PRIMARY KEY,
+    status         TEXT        NOT NULL DEFAULT 'queued',  -- queued | running | succeeded | failed
+    mapping_source TEXT,                                    -- agent | cache (set once known)
+    result         JSONB,
+    error          TEXT,
+    initiated_by   TEXT        DEFAULT 'System',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON migration_jobs (status);

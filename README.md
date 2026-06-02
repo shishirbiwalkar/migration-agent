@@ -25,8 +25,16 @@ mapping. ABASE → GDS is simply the default when no URLs are supplied.
 | **Mapping Critic** | 🟡 Single LLM call | Reviews the proposed mapping before any data moves (proposer–critic) |
 | Orchestration & writes | ⚪ Deterministic code | All staging/promotion/audit writes, the upsert-key guard, the API |
 
-See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and **[WORKFLOW.md](WORKFLOW.md)**
-for the end-to-end pipeline.
+### Documentation
+
+| Doc | Covers |
+|---|---|
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | Full system design |
+| **[WORKFLOW.md](WORKFLOW.md)** | End-to-end pipeline & HITL gates |
+| **[docs/FAILURE-MODES.md](docs/FAILURE-MODES.md)** | LLM unavailability & hallucination handling |
+| **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** | How to deploy, and fallback behaviour |
+| **[docs/SCALING.md](docs/SCALING.md)** | The five scaling ceilings and how to raise them |
+| **[CONTRIBUTING.md](CONTRIBUTING.md)** | Developer guide |
 
 ---
 
@@ -128,6 +136,7 @@ use it to inspect, audit, or roll back a specific migration.
 ├── frontend/                 HITL console (:3000)
 ├── abase-frontend/           Source viewer (:3001)
 ├── gds-frontend/             Target viewer (:3002)
+├── docs/                     Operations: failure modes, deployment, scaling
 ├── ARCHITECTURE.md           System design
 ├── WORKFLOW.md               End-to-end pipeline & HITL gates
 └── CONTRIBUTING.md           Developer guide

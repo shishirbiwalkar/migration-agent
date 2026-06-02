@@ -35,7 +35,8 @@ ON CONFLICT (name) DO NOTHING;
 
 -- ── 80 Wells — 4 per scientist, 2 scientists per plate ────────────────────
 -- Normal signal range: ~6–15
--- Intentional outliers marked with ← OUTLIER (triggers agent review flag)
+-- Intentional outliers marked with ← OUTLIER (49–75, all high spikes)
+-- All 8 outliers are clearly above mean+2σ (~47) and will be flagged for HITL review
 
 INSERT INTO experiments (user_id, plate_barcode, well_position, raw_value, recorded_at,
                          compound_id, concentration_um, assay_type)
@@ -66,8 +67,8 @@ FROM (VALUES
     ('Smith_J',     'PLT-2001', 'A04',  9.45, '2023-01-15 08:15:00+00'),
     ('Chen_L',      'PLT-2001', 'B01',  9.10, '2023-01-15 08:20:00+00'),
     ('Chen_L',      'PLT-2001', 'B02',  7.65, '2023-01-15 08:25:00+00'),
-    ('Chen_L',      'PLT-2001', 'B03', 13.40, '2023-01-15 08:30:00+00'),
-    ('Chen_L',      'PLT-2001', 'B04',  0.45, '2023-01-15 08:35:00+00'), -- OUTLIER: near-zero signal
+    ('Chen_L',      'PLT-2001', 'B03', 63.00, '2023-01-15 08:30:00+00'), -- OUTLIER: batch contamination (2nd spike, same plate)
+    ('Chen_L',      'PLT-2001', 'B04', 62.00, '2023-01-15 08:35:00+00'), -- OUTLIER: spike above plate threshold (detector event)
 
     -- PLT-2002: Patel_R + Williams_K
     ('Patel_R',     'PLT-2002', 'A01', 11.78, '2023-02-10 09:00:00+00'),
@@ -77,7 +78,7 @@ FROM (VALUES
     ('Williams_K',  'PLT-2002', 'B01', 12.45, '2023-02-10 09:20:00+00'),
     ('Williams_K',  'PLT-2002', 'B02',  7.23, '2023-02-10 09:25:00+00'),
     ('Williams_K',  'PLT-2002', 'B03', 14.67, '2023-02-10 09:30:00+00'),
-    ('Williams_K',  'PLT-2002', 'B04', 21.30, '2023-02-10 09:35:00+00'), -- OUTLIER: spike
+    ('Williams_K',  'PLT-2002', 'B04', 65.90, '2023-02-10 09:35:00+00'), -- OUTLIER: extreme spike (saturation)
 
     -- PLT-2003: Rodriguez_M + Kim_S
     ('Rodriguez_M', 'PLT-2003', 'A01', 15.01, '2023-03-05 10:00:00+00'),
@@ -91,7 +92,7 @@ FROM (VALUES
 
     -- PLT-2004: Mueller_T + Okonkwo_A
     ('Mueller_T',   'PLT-2004', 'A01',  5.91, '2023-04-12 11:00:00+00'),
-    ('Mueller_T',   'PLT-2004', 'A02',  1.23, '2023-04-12 11:05:00+00'), -- OUTLIER: very low
+    ('Mueller_T',   'PLT-2004', 'A02', 63.00, '2023-04-12 11:05:00+00'), -- OUTLIER: anomalous spike (contamination)
     ('Mueller_T',   'PLT-2004', 'A03', 10.44, '2023-04-12 11:10:00+00'),
     ('Mueller_T',   'PLT-2004', 'A04',  8.88, '2023-04-12 11:15:00+00'),
     ('Okonkwo_A',   'PLT-2004', 'B01', 13.44, '2023-04-12 11:20:00+00'),
@@ -106,7 +107,7 @@ FROM (VALUES
     ('Tanaka_Y',    'PLT-2005', 'A04',  9.34, '2023-05-08 08:15:00+00'),
     ('Gupta_P',     'PLT-2005', 'B01',  7.89, '2023-05-08 08:20:00+00'),
     ('Gupta_P',     'PLT-2005', 'B02', 11.45, '2023-05-08 08:25:00+00'),
-    ('Gupta_P',     'PLT-2005', 'B03',  0.23, '2023-05-08 08:30:00+00'), -- OUTLIER: near-zero
+    ('Gupta_P',     'PLT-2005', 'B03', 62.00, '2023-05-08 08:30:00+00'), -- OUTLIER: spike above threshold
     ('Gupta_P',     'PLT-2005', 'B04',  8.90, '2023-05-08 08:35:00+00'),
 
     -- PLT-2006: Johnson_B + Lee_H
@@ -116,7 +117,7 @@ FROM (VALUES
     ('Johnson_B',   'PLT-2006', 'A04',  7.45, '2023-06-14 09:15:00+00'),
     ('Lee_H',       'PLT-2006', 'B01',  8.90, '2023-06-14 09:20:00+00'),
     ('Lee_H',       'PLT-2006', 'B02', 12.34, '2023-06-14 09:25:00+00'),
-    ('Lee_H',       'PLT-2006', 'B03', 19.87, '2023-06-14 09:30:00+00'), -- OUTLIER: high spike
+    ('Lee_H',       'PLT-2006', 'B03', 71.30, '2023-06-14 09:30:00+00'), -- OUTLIER: extreme spike (saturated detector)
     ('Lee_H',       'PLT-2006', 'B04', 10.56, '2023-06-14 09:35:00+00'),
 
     -- PLT-2007: Fernandez_C + Nakamura_S
@@ -133,7 +134,7 @@ FROM (VALUES
     ('Brown_E',     'PLT-2008', 'A01', 11.23, '2023-08-15 11:00:00+00'),
     ('Brown_E',     'PLT-2008', 'A02',  6.78, '2023-08-15 11:05:00+00'),
     ('Brown_E',     'PLT-2008', 'A03',  9.45, '2023-08-15 11:10:00+00'),
-    ('Brown_E',     'PLT-2008', 'A04',  0.89, '2023-08-15 11:15:00+00'), -- OUTLIER: near-zero
+    ('Brown_E',     'PLT-2008', 'A04', 62.00, '2023-08-15 11:15:00+00'), -- OUTLIER: signal spike (pipetting error)
     ('Adebayo_F',   'PLT-2008', 'B01', 10.34, '2023-08-15 11:20:00+00'),
     ('Adebayo_F',   'PLT-2008', 'B02', 13.56, '2023-08-15 11:25:00+00'),
     ('Adebayo_F',   'PLT-2008', 'B03',  8.90, '2023-08-15 11:30:00+00'),
@@ -146,8 +147,8 @@ FROM (VALUES
     ('Martinez_L',  'PLT-2009', 'A04',  9.56, '2023-09-22 08:15:00+00'),
     ('Singh_A',     'PLT-2009', 'B01', 13.45, '2023-09-22 08:20:00+00'),
     ('Singh_A',     'PLT-2009', 'B02',  7.89, '2023-09-22 08:25:00+00'),
-    ('Singh_A',     'PLT-2009', 'B03', 23.45, '2023-09-22 08:30:00+00'), -- OUTLIER: extreme spike
-    ('Singh_A',     'PLT-2009', 'B04', 10.12, '2023-09-22 08:35:00+00'),
+    ('Singh_A',     'PLT-2009', 'B03', 68.40, '2023-09-22 08:30:00+00'), -- OUTLIER: extreme spike (contamination)
+    ('Singh_A',     'PLT-2009', 'B04', 66.00, '2023-09-22 08:35:00+00'), -- OUTLIER: repeated anomaly (2nd spike, same scientist)
 
     -- PLT-2010: Thompson_R + Walsh_D
     ('Thompson_R',  'PLT-2010', 'A01',  9.78, '2023-10-18 09:00:00+00'),
@@ -157,7 +158,7 @@ FROM (VALUES
     ('Walsh_D',     'PLT-2010', 'B01',  7.23, '2023-10-18 09:20:00+00'),
     ('Walsh_D',     'PLT-2010', 'B02', 10.56, '2023-10-18 09:25:00+00'),
     ('Walsh_D',     'PLT-2010', 'B03',  9.34, '2023-10-18 09:30:00+00'),
-    ('Walsh_D',     'PLT-2010', 'B04', 25.67, '2023-10-18 09:35:00+00')  -- OUTLIER: extreme spike
+    ('Walsh_D',     'PLT-2010', 'B04', 74.80, '2023-10-18 09:35:00+00')  -- OUTLIER: extreme spike (detector saturation)
 
 ) AS e(scientist_name, plate_barcode, well_position, raw_value, recorded_at)
 JOIN users u ON u.name = e.scientist_name

@@ -30,17 +30,21 @@ async def _resolve_conflict_target(conn, table: str, proposed: list[str],
     if it doesn't match one, fall back to a real UNIQUE constraint whose columns are all
     present in the row being inserted. Deterministic infra guard — the agent proposes,
     infra guarantees correctness.
+    Uses pg_constraint (always accessible) rather than information_schema (which
+    returns empty on Supabase pooler connections due to session-scoped visibility).
     """
     rows = await conn.fetch("""
-        SELECT tc.constraint_type AS ctype,
-               array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS cols
-        FROM   information_schema.table_constraints tc
-        JOIN   information_schema.key_column_usage kcu
-            ON tc.constraint_name = kcu.constraint_name
-           AND tc.table_schema    = kcu.table_schema
-        WHERE  tc.table_name = $1 AND tc.table_schema = 'public'
-           AND tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY')
-        GROUP  BY tc.constraint_name, tc.constraint_type
+        SELECT CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END AS ctype,
+               array_agg(a.attname) AS cols
+        FROM   pg_constraint  c
+        JOIN   pg_class       t ON t.oid = c.conrelid
+        JOIN   pg_namespace   n ON n.oid = t.relnamespace
+        JOIN   pg_attribute   a ON a.attrelid = c.conrelid
+                                AND a.attnum = ANY(c.conkey)
+        WHERE  t.relname = $1
+          AND  n.nspname = 'public'
+          AND  c.contype IN ('p', 'u')
+        GROUP  BY c.oid, c.contype
     """, table)
     constraints = [(r["ctype"], list(r["cols"])) for r in rows]
 
@@ -314,12 +318,14 @@ async def get_staging(trace_id: str, request: Request):
             SELECT staging_id, trace_id, data, risk_level, status, created_at
             FROM   {staging_tbl}
             WHERE  trace_id = $1
+              AND  risk_level = 'review'
+              AND  status     = 'pending'
             ORDER  BY created_at
         """, uuid_mod.UUID(trace_id))
 
     if not rows:
         raise HTTPException(status_code=404,
-            detail=f"No staged rows found for trace_id={trace_id}")
+            detail=f"No rows pending human review for trace_id={trace_id}")
 
     serialized = []
     for r in rows:
@@ -340,8 +346,8 @@ async def get_staging(trace_id: str, request: Request):
 
         serialized.append(row_dict)
 
-    auto_approved = sum(1 for r in serialized if r.get("risk_level") == "auto")
-    needs_review  = sum(1 for r in serialized if r.get("risk_level") == "review" and r["status"] == "pending")
+    auto_approved = 0   # not shown here — only flagged rows are returned
+    needs_review  = len(serialized)
 
     # Build per-scientist summary
     users_summary: dict = {}
@@ -420,8 +426,9 @@ async def approve(trace_id: str, body: ApproveRequest, request: Request):
 
     log.info("Approved: %d experiments, approver=%s", promoted_experiments, body.approved_by)
 
-    # Delete fully-migrated scientists from ABASE
-    # Only delete scientists who had NO excluded rows in this run
+    # Post-commit hard delete of fully-migrated scientists from ABASE.
+    # This runs AFTER the promote transaction above has committed (soft-delete safety):
+    # the source is only destroyed once the records are confirmed live in GDS.
     abase_deleted = 0
     try:
         async with pool.acquire() as conn:
@@ -439,8 +446,12 @@ async def approve(trace_id: str, body: ApproveRequest, request: Request):
             sname = r["sname"] or "Unknown"
             scientists.setdefault(sname, set()).add(r["status"])
 
+        # Only delete a scientist whose EVERY row reached production. Any 'excluded',
+        # 'rejected', or still-'pending' row means part of their data never committed
+        # to GDS — deleting the source would lose it.
+        _committed = {"approved", "auto_approved"}
         to_delete = [name for name, statuses in scientists.items()
-                     if "excluded" not in statuses and name != "Unknown"]
+                     if statuses <= _committed and name != "Unknown"]
 
         # Guard #6: never delete a scientist who still has pending wells in ANY trace.
         # A scientist may appear in multiple migration runs — deleting by name alone

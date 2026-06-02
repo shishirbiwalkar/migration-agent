@@ -23,9 +23,10 @@ MODEL = "gemini-2.5-flash"
 
 # Failover order. The requested model is tried first, then the rest of these.
 # All share one API/key — only the model id changes.
+# NOTE: gemini-2.0-flash was removed — it returns 404 NOT_FOUND on this API/key, so it
+# only ever wasted a failover hop and pushed calls onto the weakest model.
 FALLBACK_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
 ]
 

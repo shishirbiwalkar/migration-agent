@@ -30,16 +30,17 @@ Optional body: `source_db_url`, `target_db_url`, `initiated_by`. Defaults to ABA
    - emits `cleaned_records` + a `promotion_config` JSON mapping
 2. **Write to staging.** Infrastructure writes all records to `gds_staging_experiments` as JSONB
    (`status='pending'`).
-3. **Store the plan.** `promotion_config` is saved to `migration_plans` for this `trace_id`.
-4. **Mapping Critic.** A single-shot LLM audit of the mapping → `APPROVE` / `FLAG` (best-effort;
-   surfaced, does not block the trusted pipeline).
-5. **Auto-promote clean records.** Records with `risk_level='auto'` are promoted to
-   `gds_experiments` immediately — no human needed.
-6. **Flagged records remain** in staging for human review.
-
-> **Note (known caveat):** source records for fully-auto-approved researchers are currently removed
-> from ABASE during this stage. The intended hardening is to perform that removal only *after* a
-> confirmed successful promotion. Tracked as the one remaining correctness item.
+3. **Mark the source `migrating`.** Involved ABASE researchers are set to
+   `migration_status='migrating'`. No source data is deleted here.
+4. **Store the plan.** `promotion_config` is saved to `migration_plans` for this `trace_id`.
+5. **Mapping Critic.** A single-shot LLM audit of the mapping → `APPROVE` / `FLAG`. A critic
+   *failure* (LLM unavailable) does not block the run. On a `FLAG` *verdict*, every staged row is
+   flipped to `risk_level='review'` and auto-promotion is skipped — all records go to human review.
+6. **Auto-promote clean records.** If the critic did not flag, records with `risk_level='auto'` are
+   promoted to `gds_experiments` immediately — no human needed.
+7. **Delete fully-migrated sources.** After promotion commits, a researcher is hard-deleted from
+   ABASE only if every one of their staged rows is `auto_approved`. Anyone with a flagged or pending
+   row stays in ABASE (`migration_status='migrating'`) until HITL resolves them.
 
 **Result:** `N` staged, `X` auto-promoted, `Y` pending review. If `Y > 0`, HITL is required.
 
@@ -104,7 +105,9 @@ produces an equivalent report.
 
 ## State & status reference
 
-- **Staging `risk_level`:** `auto` (clean) · `review` (flagged)
+- **Source `migration_status` (ABASE `users`):** `active` → `migrating` (records staged) → row
+  hard-deleted after its records are confirmed live in GDS.
+- **Staging `risk_level`:** `auto` (clean) · `review` (flagged, or forced by a critic `FLAG`)
 - **Staging `status`:** `pending` → `auto_approved` / `approved` / `excluded` / `rejected`
 - **Audit events:** `auto_approved`, `hitl_approved`, `hitl_excluded`, `hitl_rejected`
 - **Report verdict:** `Overall: PASS` (everything reconciles, accurate, nothing pending) else

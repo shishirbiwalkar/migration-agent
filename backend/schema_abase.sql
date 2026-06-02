@@ -10,8 +10,15 @@ CREATE TABLE IF NOT EXISTS users (
     email               TEXT,
     last_login          TIMESTAMPTZ,
     active_time_minutes INTEGER      NOT NULL DEFAULT 0,
+    -- Migration state tracking. Source rows are NEVER deleted before the target
+    -- has committed. A row moves 'active' -> 'migrating' when its records are staged,
+    -- and is hard-deleted only after GDS confirms the records are live (soft-delete safety).
+    migration_status    TEXT         NOT NULL DEFAULT 'active',
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+-- For existing ABASE databases: add the column if the table predates this change.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS migration_status TEXT NOT NULL DEFAULT 'active';
 
 CREATE TABLE IF NOT EXISTS experiments (
     id               BIGSERIAL        PRIMARY KEY,

@@ -1,39 +1,127 @@
-# Project: AI-Driven Enterprise Data Migration Bridge
+# Project Brief — Migration Agent Platform
 
-## Architectural Overview
-This project simulates two distinct enterprise systems:
-1. **ABASE (Legacy):** Minimalist, light-mode, utilitarian administrative module.
-2. **GDS (Target):** Modern, dark-mode, high-performance SaaS dashboard with teal accents.
+An AI-driven enterprise data migration platform. Moves records from a legacy system (ABASE) to a new system (GDS) with full schema discovery, anomaly screening, human-in-the-loop review, and an auditable verification report — all without any agent ever writing to a database.
 
-The bridge between them is an AI-powered ETL pipeline using Gemini/Claude to generate cleaning scripts, with an explicit **Human-in-the-Loop (HITL)** verification layer.
+---
 
-## Core Tech Stack
-* **Frontend:** Next.js (App Router), Tailwind CSS.
-* **Backend:** FastAPI, Pandas, `asyncpg` (SQLAlchemy).
-* **Database:** Supabase (PostgreSQL).
-* **AI Engine:** Google Gemini API (Dynamic ETL Scripting).
+## The Problem
 
-## Operational Rules & Safety (MUST FOLLOW)
-1. **HITL Verification:** Before any migration is committed to the `gds_experiments` production table, the system must pause. It must output a `migration_plan.json` showing row counts and schema mapping for human approval in the UI.
-2. **Staging Table Pattern:** All AI-cleaned data must first land in `gds_staging_experiments` (UNLOGGED table). Only after human approval is it moved to the `gds_experiments` production table.
-3. **Tracing:** Every single file ingestion process must be assigned a `trace_id` (UUID). This ID must persist through the logs, the database audit tables, and the UI feedback loop.
-4. **CORS & Networking:** Explicitly configure `CORSMiddleware` in `main.py` to allow communication between the Next.js frontend and the FastAPI backend.
-5. **No Data Exposure:** LLM prompts must only contain `df.head()` and schema definitions. Never send the full file contents.
+Enterprise data migrations fail in two ways: silent data corruption (wrong mapping nobody noticed) and "human bottleneck" (every row needs manual sign-off). This platform solves both:
+- The AI maps schemas and screens anomalies automatically
+- Only the genuinely uncertain rows go to a human
+- An independent agent audits the result
 
-## Database Schema (Supabase/PostgreSQL)
-* **`abase_legacy_users`:** id (PK), name, department.
-* **`gds_users`:** gds_user_id (PK), name, role.
-* **`gds_staging_experiments` (UNLOGGED):** staging_id (PK), trace_id, well_position, signal, status.
-* **`gds_experiments` (PRODUCTION):** experiment_id (PK), gds_user_id (FK), trace_id, signal.
+---
 
-## Development Constraints
-1. **Theme Separation:** Frontend components must be strictly themed. ABASE is `bg-slate-50 text-black`. GDS is `bg-slate-900 text-teal-400`.
-2. **Idempotency:** All DB insertions must be `UPSERT`. Use `INSERT ... ON CONFLICT (trace_id) DO UPDATE`.
-3. **Error Logging:** If the AI script generation fails, the system must create a log entry in `migration_audit_log` with the `trace_id` and the specific Python error traceback.
+## System Overview
 
-## Execution Priority (Step-by-Step)
-1. **Backend Foundation:** Set up FastAPI with Supabase connectivity and the `trace_id` middleware.
-2. **ETL Engine:** Build the Pandas/AI integration with the staging table pattern.
-3. **HITL Workflow:** Implement the "Pause and Approve" logic between Staging and Production.
-4. **Frontend Modules:** Build the two distinct modules (ABASE and GDS) with their respective themes.
-5. **Final Integration:** Connect the Frontend "Execute" button to the Backend API and wire up the audit logs.
+```
+ABASE (legacy, Supabase us-west-2)    GDS (target, Supabase us-east-2)
+  users + experiments            →      gds_users + gds_experiments
+                                         (via staging → production)
+
+FastAPI backend (:8001)
+  Migration Agent      reads source, proposes mapping, screens anomalies
+  Mapping Critic       audits the mapping before any data moves
+  Review Resolution    translates researcher messages → approve/exclude
+  Verification Agent   independently audits the completed migration
+
+Three Next.js frontends
+  :3000  HITL Console   run migration, review flagged wells, read reports
+  :3001  ABASE viewer   browse source data
+  :3002  GDS viewer     browse migrated data
+```
+
+---
+
+## Reference Dataset
+
+**20 scientists, 80 wells** (4 wells per scientist).
+
+**10 wells intentionally flagged** for HITL demo:
+| Scientist | Flagged wells | Scenario |
+|---|---|---|
+| Chen_L | B03 (63.00), B04 (62.00) | Batch contamination — 2 spikes on same plate |
+| Singh_A | B03 (68.40), B04 (66.00) | Repeated anomaly — same scientist, 2 wells |
+| Williams_K | B04 (65.90) | Single saturation spike |
+| Mueller_T | A02 (63.00) | Contamination |
+| Gupta_P | B03 (62.00) | Above-threshold reading |
+| Lee_H | B03 (71.30) | Saturated detector |
+| Brown_E | A04 (62.00) | Pipetting error |
+| Walsh_D | B04 (74.80) | Clear anomaly |
+
+70 normal wells (signal 5–15) auto-promote without human review.
+
+---
+
+## Core Design Rules
+
+1. **Agents never write to a database.** The only writers are `api/agent.py` and `api/migration.py`.
+2. **The LLM never computes exact figures.** All math (thresholds, counts, reconciliation) runs in pandas/numpy or SQL.
+3. **`promotion_config` is the contract.** The Migration Agent outputs a JSON mapping; all downstream code (promotion, review, verification) consumes it without re-asking the LLM.
+4. **Every write is attributed.** Actor + timestamp in `migration_audit_log` for every auto-approve, approve, exclude, reject.
+5. **Source is never deleted before target is confirmed.** ABASE scientists are hard-deleted only after all their wells are live in GDS.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Python 3.11+, FastAPI, asyncpg |
+| AI | Google Gemini (`google-genai` SDK), model failover chain |
+| Data transform | pandas, numpy |
+| Frontends | Next.js 14 / React / Tailwind CSS (×3) |
+| Database | PostgreSQL via Supabase (managed, no infra to run) |
+
+---
+
+## Key Endpoints
+
+| Method | Path | What it does |
+|---|---|---|
+| `POST` | `/api/agent/run` | Full migration: discover → transform → screen → stage → auto-promote |
+| `GET` | `/api/migrate/staging/{trace_id}` | Pending review rows for a run |
+| `POST` | `/api/migrate/approve/{trace_id}` | HITL approve — promotes flagged rows to production |
+| `POST` | `/api/migrate/reject/{trace_id}` | HITL reject |
+| `POST` | `/api/migrate/rollback/{trace_id}` | Roll back an approved run |
+| `POST` | `/api/report/{trace_id}` | Generate verification report |
+| `GET` | `/api/abase/users` | List source scientists |
+| `GET` | `/api/gds/users` | List promoted scientists |
+
+---
+
+## Demo Flow
+
+```
+python backend/scripts/reset_demo.py    # → READY FOR DEMO ✓
+
+POST /api/agent/run
+  → 70 wells auto-promoted, 10 flagged (Chen_L ×2, Singh_A ×2, 6 others ×1)
+
+Open localhost:3000/review?trace_id=<id>
+  → Approve / exclude / reject flagged wells
+
+POST /api/report/<trace_id>
+  → Verification Agent produces enterprise report with Overall: PASS
+```
+
+---
+
+## What Is and Isn't Done
+
+**Done:**
+- Full 4-agent system (Migration, Critic, Review Resolution, Verification)
+- HITL console with approve/exclude/reject/rollback
+- Mapping cache (skips LLM on repeated schema runs)
+- Async run path (`POST /api/agent/run/async` + job polling)
+- Full audit trail with attribution
+- Model failover (`gemini-2.5-flash → 2.0-flash → 2.5-flash-lite`)
+- Three themed frontends (ABASE light, GDS dark, HITL console)
+
+**Not done (future):**
+- Docker Compose / containerized deployment
+- Automated test suite
+- Durable async queue (current async is in-process, doesn't survive restart)
+- Orchestrator agent (current pipeline is a fixed linear sequence)
+- Notification system (HITL review is pull-based, no email/Slack)

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Migration Agent** is an AI-driven, read-only data migration system that discovers source/target database schemas at runtime, reasons about column mapping, generates pandas transformation scripts, classifies rows by anomaly detection, and stages cleaned data for human-in-the-loop review.
 
-**Core principle:** Agent is purely computational and never writes to any database. All DB writes are handled by deterministic infrastructure code, leaving a full audit trail.
+**Core principle:** Agents are purely computational and never write to any database. All DB writes are handled by deterministic infrastructure code, leaving a full audit trail.
 
 ## Architecture
 
@@ -19,175 +19,190 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 #### Backend (Python + FastAPI)
 - **`app/main.py`** — FastAPI app, dual pool lifespan, CORS, trace ID middleware
-- **`app/agents/migration_agent.py`** — Core agent (300+ lines) — truly generic, read-only
-  - Accepts `source_url` and `target_url` parameters (works with ANY PostgreSQL databases)
+- **`app/agents/migration_agent.py`** — Core migration agent — truly generic, read-only
+  - Accepts `source_url` and `target_url` (works with ANY PostgreSQL databases)
   - Discovers schemas via `information_schema` at runtime
   - Samples real rows, transforms in-memory with pandas + numpy
   - Classifies rows using statistical anomaly detection (mean ± 2σ)
   - Returns `cleaned_records` + `promotion_config` JSON (schema mapping)
   - Tool self-repair loop: on script error, agent reads traceback and rewrites
   - Per-run state via `_RunState` dataclass (no module-level globals)
-- **`app/api/agent.py`** — Agent orchestration
-  - `POST /api/agent/run` accepts optional `source_db_url` and `target_db_url`
-  - Step 1: Run agent (read-only), Step 2: Write to staging, Step 3: Store promotion config, Step 4: Auto-approve 'auto' rows
-  - Returns counts of auto-approved vs. pending-review rows
+- **`app/agents/critic_agent.py`** — Single-shot LLM review of `promotion_config` before any data moves
+  - Returns `APPROVE` / `FLAG` verdict; a `FLAG` forces every row to mandatory HITL
+  - Fail-open: if Gemini is unavailable, pipeline proceeds (critic unavailability ≠ data risk)
+- **`app/agents/review_agent.py`** — Review Resolution Agent (agentic, tool-calling loop)
+  - Translates a researcher's plain-English message into approve/exclude/reject decisions
+  - 5 tools: `get_pending_wells`, `approve_well`, `exclude_well`, `approve_all_wells`, `exclude_all_wells`
+  - Writes attributed audit events (actor + timestamp)
+- **`app/agents/verification_agent.py`** — Verification Agent (agentic, 8 read-only tools)
+  - Mandatory battery: reconciliation, independent anomaly re-check, staging vs production comparison
+  - Produces an enterprise-grade report ending in `Overall: PASS` / `NEEDS REVIEW`
+  - Falls back to deterministic `report_agent.py` if Gemini is unavailable
+- **`app/api/agent.py`** — Orchestration pipeline
+  - `POST /api/agent/run` — synchronous run; `POST /api/agent/run/async` — background run + poll
+  - Steps: Run agent → Write staging → Mark source → Store plan → Run critic → Auto-approve clean rows
 - **`app/api/migration.py`** — HITL pipeline
-  - `_promote_rows()` — Generic function using agent's `promotion_config` JSON to promote ANY schema (not hardcoded)
-  - `auto_approve_clean_rows()` — Auto-promote rows with risk_level='auto'
-  - `approve()` endpoint — Human approves review rows
-  - `reject()` endpoint — Human rejects review rows
-  - Full audit trail via `migration_audit_log` table
-- **`app/api/abase.py`** — Read ABASE data
-  - `GET /api/abase/users` — List ABASE scientists
-  - `GET /api/abase/users/{id}` — Scientist detail + experiments
-  - `GET /api/abase/experiments` — All experiments joined with scientist names (fed to agent)
-- **`app/api/gds.py`** — Read GDS data
-  - `GET /api/gds/users` — List GDS scientists with avg_signal summary
-  - `GET /api/gds/users/{id}/experiments` — Drill-down into individual wells
-  - `GET /api/gds/experiments` — All production well records
-- **`app/connectors/`** — Async PostgreSQL pool management
-  - Shared `_create_pool(url)` function handles URL parsing and special character decoding
+  - `_promote_rows()` — Generic promotion using agent's `promotion_config` (no hardcoded schema)
+  - `_resolve_conflict_target()` — Validates agent's proposed ON CONFLICT keys against **real** `pg_constraint` catalog (NOT `information_schema` — that view returns empty on Supabase pooler connections); falls back to the actual UNIQUE constraint
+  - `auto_approve_clean_rows()` — Auto-promote `risk_level='auto'` rows
+  - `approve()` / `reject()` / `rollback()` endpoints with full audit trail
+- **`app/api/abase.py`** — Read ABASE data (list scientists, drill into experiments)
+- **`app/api/gds.py`** — Read GDS data (list promoted scientists, drill into wells)
+- **`app/connectors/`** — Async PostgreSQL pool management; shared `_create_pool(url)` decodes percent-encoded passwords
 
 #### Frontends (Next.js + React)
-- **`frontend/`** — Main HITL review UI (localhost:3000) — shows pending rows, approve/reject/rollback
+- **`frontend/`** — Main HITL console (localhost:3000) — run migration, review flagged wells, generate reports
 - **`abase-frontend/`** — ABASE legacy data viewer (localhost:3001)
 - **`gds-frontend/`** — GDS target data viewer (localhost:3002)
 
 ### Database Schema
-- **`schema_abase.sql`** — ABASE tables: `users` (8 scientists), `experiments` (25 wells)
+- **`schema_abase.sql`** — ABASE tables: `users`, `experiments`
 - **`schema_gds.sql`** — GDS tables:
   - `gds_users` — scientists by name (UUID primary key)
-  - `gds_staging_experiments` — UNLOGGED table, fast transient buffer (data lost on crash intentional)
-  - `gds_experiments` — production wells, immutable once approved
+  - `gds_staging_experiments` — UNLOGGED table, fast transient buffer (data loss on crash intentional)
+  - `gds_experiments` — production wells, UNIQUE(gds_user_id, well_position), immutable once approved
   - `migration_plans` — stores agent's `promotion_config` JSON per trace_id
-  - `migration_audit_log` — full audit trail
+  - `migration_audit_log` — append-only audit trail
+  - `migration_mappings` — schema-fingerprint → cached transform (skips LLM on repeated runs)
+  - `migration_jobs` — async job tracking (queued / running / succeeded / failed)
+
+## Demo Data (`seed_abase_v2.sql`)
+
+**20 scientists, 80 wells** (4 wells per scientist across 10 plates, 2 scientists per plate).
+
+**10 flagged wells** (signal values 62–75, well above the mean±2σ threshold of ~54):
+- **Chen_L** — 2 flagged wells (B03: 63.00, B04: 62.00) — batch contamination scenario
+- **Singh_A** — 2 flagged wells (B03: 68.40, B04: 66.00) — repeated anomaly scenario
+- Williams_K, Mueller_T, Gupta_P, Lee_H, Brown_E, Walsh_D — 1 flagged well each
+
+**70 normal wells** (signal values 5.32–15.01) auto-promote without human review.
+
+The spike values are deliberately chosen so that even with 10 outliers inflating σ, the 2σ upper bound (~54.6) stays below the lowest outlier (62.0) by a margin of ~7.4 — ensuring reliable flagging regardless of floating-point variance.
 
 ## Commands
 
-### Backend
-
+### Demo Reset (run before every demo session)
 ```bash
 cd backend
+python scripts/reset_demo.py
+# Expected output ends with:
+#   ABASE → 20 scientists, 80 wells
+#   GDS   → 0 users, 0 experiments, 0 staging rows
+#   Status: READY FOR DEMO ✓
+```
+The script verifies counts after both TRUNCATE and seed; exits with error if anything is wrong.
 
-# Install dependencies
+### Backend
+```bash
+cd backend
 pip install -r requirements.txt
-
-# Run development server (auto-reload, port 8001)
 python -m uvicorn app.main:app --reload --port 8001
-
-# Health check
 curl http://localhost:8001/health
 ```
 
 ### Frontends
-
 ```bash
-# Each frontend is independent Next.js app
-
-# Main HITL UI
-cd frontend
-npm install
-npm run dev    # localhost:3000
-
-# ABASE viewer
-cd abase-frontend
-npm install
-npm run dev    # localhost:3001
-
-# GDS viewer
-cd gds-frontend
-npm install
-npm run dev    # localhost:3002
+cd frontend      && npm install && npm run dev   # localhost:3000
+cd abase-frontend && npm install && npm run dev  # localhost:3001
+cd gds-frontend   && npm install && npm run dev  # localhost:3002
 ```
 
 ## Key Concepts
 
 ### Agent Genericity
-The agent **never knows about ABASE or GDS by name**. It only knows:
-- `source_url` — any PostgreSQL connection string
-- `target_url` — any PostgreSQL connection string
+The Migration Agent **never knows about ABASE or GDS by name**. It only knows:
+- `source_url` / `target_url` — any PostgreSQL connection strings
 - `information_schema` — reads actual table/column names at runtime
 - `promotion_config` JSON — the agent **outputs** a mapping; infrastructure reads it back
 
-This means the agent works for ANY PostgreSQL → PostgreSQL migration. ABASE → GDS is just the default when no URLs are passed.
+Works for ANY PostgreSQL → PostgreSQL migration. ABASE → GDS is just the default.
 
 ### Anomaly Detection
-The agent computes thresholds dynamically from actual data:
+Thresholds computed dynamically from actual sampled data (not hardcoded):
 ```
-mean_value = avg of all signal values in sample
-std_dev = standard deviation
-threshold = mean ± 2σ
+mean   = avg of signal column
+std    = standard deviation
+flagged = value < mean − 2σ  OR  value > mean + 2σ
 ```
-Rows outside this range are marked `risk_level='review'`; inside are `risk_level='auto'`.
+The Verification Agent **independently recomputes** these thresholds to audit the Migration Agent's work.
 
 ### Partial HITL
-- **Auto rows**: Agent classified them as safe → auto-promote to `gds_experiments` immediately (no human needed)
-- **Review rows**: Anomalous → stage in `gds_staging_experiments` → human approves/rejects via `/review?trace_id=XXX` UI
+- **Auto rows** (`risk_level='auto'`): safe → auto-promote to `gds_experiments` immediately
+- **Review rows** (`risk_level='review'`): anomalous → held in `gds_staging_experiments` → human approves/rejects via `/review?trace_id=XXX` UI or Review Resolution Agent
 
 ### Trace ID
-Every run is tagged with a UUID `trace_id` that flows through:
-1. Agent run request
-2. Staging table (all rows)
-3. Audit log (one entry per trace)
-4. HITL approve/reject decisions
-
-Use `trace_id` to audit, rollback, or inspect a specific migration run.
+UUID `trace_id` flows through: agent run → staging rows → `migration_plans` → `migration_audit_log` → HITL decisions → verification report. Use it to audit, roll back, or inspect any run.
 
 ## Database Connections
 
-**Special character handling:** ABASE password contains `@` symbol. Solution:
-1. `.env` stores it percent-encoded: `Supabase%402799`
-2. `_create_pool()` calls `urllib.parse.unquote()` to decode
+**Special character handling:** ABASE password contains `@`. Solution: `.env` percent-encodes it (`%40`); `_create_pool()` calls `urllib.parse.unquote()` before connecting.
+
+**Supabase pooler caveat:** `_resolve_conflict_target()` in `migration.py` queries `pg_constraint` + `pg_class` + `pg_attribute` (NOT `information_schema`) to discover real UNIQUE constraints. `information_schema.key_column_usage` returns empty rows on Supabase's pgBouncer pooler sessions, which caused a silent fallback to unvalidated ON CONFLICT keys and a PostgreSQL `InvalidColumnReferenceError`. Always use `pg_catalog` for DDL introspection on Supabase.
 
 **Connection pooling:** Async pools with min_size=1, max_size=5. Lifespan managed by FastAPI.
 
 ## Debugging
 
-### Check Staging Data
+### Check Both DBs at Once
 ```bash
-# Via API
-curl http://localhost:8001/api/gds/experiments
+cd backend && python3 << 'EOF'
+import asyncio, os, urllib.parse
+import asyncpg
+from dotenv import load_dotenv
+from pathlib import Path
 
-# Show pending review rows
-curl "http://localhost:8001/api/migration/review?trace_id=<UUID>"
-```
-
-### Check Agent Reasoning
-Agent logs include tool calls, pandas script attempts, and repair loops. Check stderr for detail.
-
-### Database State
-```python
-# Quick status check
-python3 << 'EOF'
-import asyncio
-from app.connectors import get_gds_pool
+load_dotenv(Path(".env"))
 
 async def check():
-    pool = await get_gds_pool()
-    async with pool.acquire() as conn:
-        staging = await conn.fetchval("SELECT COUNT(*) FROM gds_staging_experiments")
-        prod = await conn.fetchval("SELECT COUNT(*) FROM gds_experiments")
-        audit = await conn.fetchval("SELECT COUNT(*) FROM migration_audit_log")
-        print(f"Staging: {staging}, Production: {prod}, Audit: {audit}")
+    for label, env_var in [("ABASE", "ABASE_DATABASE_URL"), ("GDS", "GDS_DATABASE_URL")]:
+        url = os.getenv(env_var)
+        p = urllib.parse.urlparse(url)
+        conn = await asyncpg.connect(
+            host=p.hostname, port=p.port or 5432,
+            user=urllib.parse.unquote(p.username or ""),
+            password=urllib.parse.unquote(p.password or ""),
+            database=p.path.lstrip("/"), ssl="require", statement_cache_size=0
+        )
+        if label == "ABASE":
+            print(f"ABASE → {await conn.fetchval('SELECT COUNT(*) FROM users')} scientists, "
+                  f"{await conn.fetchval('SELECT COUNT(*) FROM experiments')} wells")
+        else:
+            print(f"GDS   → users={await conn.fetchval('SELECT COUNT(*) FROM gds_users')}, "
+                  f"experiments={await conn.fetchval('SELECT COUNT(*) FROM gds_experiments')}, "
+                  f"staging={await conn.fetchval('SELECT COUNT(*) FROM gds_staging_experiments')}")
+        await conn.close()
 
 asyncio.run(check())
 EOF
 ```
 
+### Check Pending Review Rows
+```bash
+curl "http://localhost:8001/api/migrate/staging/<trace_id>"
+```
+
+### Agent Reasoning
+Agent logs include every tool call, the pandas script attempts, and self-repair loops.
+```bash
+tail -f backend/logs/backend.log
+```
+
 ## Gemini API Key
 
-The agent requires a valid Gemini API key with available quota. Key location: `.env` as `GEMINI_API_KEY`.
+Key location: `backend/.env` as `GEMINI_API_KEY`. Billing-enabled key strongly recommended.
 
-**Quota issues:** Free tier is 5 requests/minute. If exhausted:
+**Free tier:** 5 requests/minute — a single agent run can exhaust it. If you get 503s:
 1. Go to https://aistudio.google.com/app/apikey
-2. Create a new key
-3. **Copy immediately** without navigating away (navigating away invalidates it)
-4. Update `.env` and restart server
+2. Create a new key and copy it immediately (navigating away invalidates it)
+3. Update `.env` and restart the server
+
+**Model failover chain:** `gemini-2.5-flash` → `gemini-2.0-flash` → `gemini-2.5-flash-lite` (in `app/core/llm.py`). Transient errors retry across the chain; non-transient errors surface immediately.
 
 ## Important Notes
 
-- **Agent is read-only by design** — all database writes happen in `api/agent.py` and `api/migration.py`, never in the agent itself
-- **No hardcoded database identifiers** — table names, column names, FK relationships all come from `information_schema` or the agent's `promotion_config` JSON
-- **Promotion config is the glue** — agent outputs it; infrastructure reads it back generically
-- **UNLOGGED staging table is intentional** — fast, no WAL, data lost on crash (acceptable for transient staging)
-- **Production wells are immutable** — `gds_experiments` has UNIQUE(gds_user_id, well_position) constraint to prevent duplicates on re-migration
+- **Agents are read-only by design** — all DB writes happen in `api/agent.py` and `api/migration.py`
+- **No hardcoded database identifiers** — table/column names come from `information_schema` at runtime or from the agent's `promotion_config` JSON
+- **`promotion_config` is the glue** — agent outputs it; infrastructure reads it back generically
+- **UNLOGGED staging table is intentional** — fast, no WAL overhead; data loss on crash is acceptable for transient staging
+- **Production wells are immutable** — `UNIQUE(gds_user_id, well_position)` prevents duplicates on re-migration
+- **ABASE cleanup is post-commit** — scientists are hard-deleted from ABASE only after ALL their wells are confirmed live in GDS; partial migrations leave source intact
