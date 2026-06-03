@@ -2,6 +2,12 @@
 -- GDS Target System Schema
 -- Run this in your GDS Supabase project (SQL Editor)
 -- ============================================================
+--
+-- RLS NOTE: After creating all tables, run the block at the bottom of this
+-- file to enable Row-Level Security on every table. This blocks public REST
+-- API access (Supabase anon/authenticated roles) while leaving the backend
+-- unaffected — it connects as the postgres superuser, which bypasses RLS.
+-- ============================================================
 
 CREATE TABLE IF NOT EXISTS gds_users (
     gds_user_id UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -101,5 +107,19 @@ CREATE TABLE IF NOT EXISTS migration_jobs (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ============================================================
+-- Row-Level Security
+-- Blocks all public REST API access (Supabase anon / authenticated roles).
+-- The backend connects as the postgres superuser → bypasses RLS, no policy needed.
+-- Run this block once after all tables are created.
+-- ============================================================
+ALTER TABLE gds_users                  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE gds_staging_experiments    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE gds_experiments            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE migration_plans            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE migration_audit_log        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE migration_mappings         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE migration_jobs             ENABLE ROW LEVEL SECURITY;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON migration_jobs (status);
