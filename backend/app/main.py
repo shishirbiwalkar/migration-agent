@@ -20,6 +20,7 @@ from app.api.agent     import router as agent_router
 from app.api.reviewer  import router as reviewer_router
 from app.api.report    import router as report_router
 from app.api.critic    import router as critic_router
+from app.api.respond   import router as respond_router
 
 _LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
@@ -76,6 +77,7 @@ app.include_router(agent_router)
 app.include_router(reviewer_router)
 app.include_router(report_router)
 app.include_router(critic_router)
+app.include_router(respond_router)
 
 
 @app.middleware("http")

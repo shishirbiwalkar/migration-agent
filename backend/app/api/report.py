@@ -20,22 +20,49 @@ async def get_completed_runs():
     """
     pool = await get_gds_pool()
     async with pool.acquire() as conn:
-        # Traces that have staging rows but none pending
-        rows = await conn.fetch("""
-            SELECT
-                trace_id,
-                MIN(created_at)  AS run_date,
-                COUNT(*)         AS total_rows,
-                COUNT(*) FILTER (WHERE status = 'auto_approved') AS auto_approved,
-                COUNT(*) FILTER (WHERE status = 'approved')      AS hitl_approved,
-                COUNT(*) FILTER (WHERE status = 'excluded')      AS excluded,
-                COUNT(*) FILTER (WHERE status = 'pending')       AS pending
-            FROM gds_staging_experiments
-            GROUP BY trace_id
-            HAVING COUNT(*) FILTER (WHERE status = 'pending') = 0
-            ORDER BY MIN(created_at) DESC
-            LIMIT 20
-        """)
+        # Collect all unique staging tables from migration plans
+        plan_rows = await conn.fetch("SELECT DISTINCT plan_json FROM migration_plans")
+        staging_tables: set[str] = set()
+        import json as json_lib
+        for pr in plan_rows:
+            try:
+                plan = json_lib.loads(pr["plan_json"]) if isinstance(pr["plan_json"], str) \
+                       else pr["plan_json"]
+                st = (plan or {}).get("staging_table")
+                if st:
+                    staging_tables.add(st)
+            except Exception:
+                pass
+
+        if not staging_tables:
+            return JSONResponse(content={"runs": []})
+
+        # Validate table names and query all staging tables
+        from app.core.mapping import validate_identifier as _validate_identifier
+        rows = []
+        for table in sorted(staging_tables):
+            try:
+                table = _validate_identifier(table, "staging_table")
+                table_rows = await conn.fetch(f"""
+                    SELECT
+                        trace_id,
+                        MIN(created_at)  AS run_date,
+                        COUNT(*)         AS total_rows,
+                        COUNT(*) FILTER (WHERE status = 'auto_approved') AS auto_approved,
+                        COUNT(*) FILTER (WHERE status = 'approved')      AS hitl_approved,
+                        COUNT(*) FILTER (WHERE status = 'excluded')      AS excluded,
+                        COUNT(*) FILTER (WHERE status = 'pending')       AS pending
+                    FROM {table}
+                    GROUP BY trace_id
+                    HAVING COUNT(*) FILTER (WHERE status = 'pending') = 0
+                    ORDER BY MIN(created_at) DESC
+                """)
+                rows.extend(table_rows)
+            except Exception:
+                continue
+
+        # Sort by run_date and limit to 20
+        rows = sorted(rows, key=lambda r: r["run_date"], reverse=True)[:20]
 
     runs = []
     for r in rows:

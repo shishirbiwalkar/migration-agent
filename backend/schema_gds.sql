@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS gds_experiments (
 CREATE INDEX IF NOT EXISTS idx_experiments_trace_id ON gds_experiments (trace_id);
 CREATE INDEX IF NOT EXISTS idx_experiments_user_id  ON gds_experiments (gds_user_id);
 
+
 CREATE TABLE IF NOT EXISTS migration_plans (
     id         BIGSERIAL   PRIMARY KEY,
     trace_id     UUID        NOT NULL,
@@ -109,6 +110,28 @@ CREATE TABLE IF NOT EXISTS migration_jobs (
 );
 
 -- ============================================================
+-- Scientist self-serve review invitations — magic-link outreach
+-- One opaque token per (trace, scientist). Auto-created by the backend on first
+-- use as well (app/api/respond.py), so this DDL is optional for dev.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS review_invitations (
+    id             BIGSERIAL   PRIMARY KEY,
+    token          TEXT        NOT NULL UNIQUE,             -- secrets.token_urlsafe(32)
+    trace_id       UUID        NOT NULL,
+    scientist_name TEXT        NOT NULL,
+    status         TEXT        NOT NULL DEFAULT 'notified', -- notified | replied | resolved | expired
+    channel        TEXT        NOT NULL DEFAULT 'console',
+    reply_text     TEXT,                                    -- the scientist's own words (audit evidence)
+    sent_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    responded_at   TIMESTAMPTZ,
+    expires_at     TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
+    CONSTRAINT uq_invite_trace_scientist UNIQUE (trace_id, scientist_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_invitations_token ON review_invitations (token);
+CREATE INDEX IF NOT EXISTS idx_invitations_trace ON review_invitations (trace_id);
+
+-- ============================================================
 -- Row-Level Security
 -- Blocks all public REST API access (Supabase anon / authenticated roles).
 -- The backend connects as the postgres superuser → bypasses RLS, no policy needed.
@@ -121,5 +144,6 @@ ALTER TABLE migration_plans            ENABLE ROW LEVEL SECURITY;
 ALTER TABLE migration_audit_log        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE migration_mappings         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE migration_jobs             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE review_invitations         ENABLE ROW LEVEL SECURITY;
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON migration_jobs (status);

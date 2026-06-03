@@ -43,6 +43,13 @@ code performs every write, and humans handle only the uncertain rows.
 └──────────────────────────────────┬───────────────────────────────────────┘
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
+│  1b. SOURCE BACKUP  (non-blocking)                             ⚪        │
+│      cloud snapshot of the source DB BEFORE any change                   │
+│      provider: aws_rds / supabase / webhook / none                       │
+│      record snapshot_id → migration_source_backups + SQLite log          │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
 │  2.  MIGRATION AGENT                                            🟢        │
 │      discover schemas ─▶ sample rows ─▶ write+test pandas ─▶ classify    │
 │      (information_schema)            (self-repair on error)   (mean ± 2σ) │
@@ -119,6 +126,7 @@ An LLM in a loop that chooses which tools to call until a goal is met.
 | **Migration Agent** | `app/agents/migration_agent.py` | 5 | Discovers schemas, samples data, writes & **self-repairs** a pandas transform, screens anomalies, emits `promotion_config` |
 | **Review Resolution Agent** | `app/agents/review_agent.py` | 5 | NL message → approve/exclude wells; writes attributed audit events |
 | **Verification Agent** | `app/agents/verification_agent.py` | 8 (read-only) | Mandatory-tool battery + discretionary investigation; independently re-checks the migration's classification |
+| **Orchestrator Agent** *(opt-in)* | `app/agents/orchestrator_agent.py` | 8 | LLM-driven pipeline that reasons step-by-step and delegates to the sub-agents instead of running the fixed flow. Enabled with `ORCHESTRATOR_AGENT=true`; off by default (see §8) |
 
 ### 🟡 LLM-powered but not agentic — single shot
 One LLM call, no loop, no tools.
@@ -131,12 +139,14 @@ One LLM call, no loop, no tools.
 ### ⚪ Deterministic code — no LLM
 | Area | File(s) |
 |---|---|
-| Orchestration | `app/api/agent.py` (fixed pipeline; not an orchestrator agent — see §8) |
-| Writes & promotion | `app/api/migration.py` (`_promote_rows`, approve/reject, upsert-key guard, audit log) |
+| Orchestration | `app/api/agent.py` (default fixed pipeline; delegates to the Orchestrator Agent when `ORCHESTRATOR_AGENT=true` — see §8) |
+| Shared pipeline steps | `app/api/pipeline_helpers.py` (`write_to_staging`, `store_migration_plan`, `mark_source_migrating`, `force_all_to_review`, `purge_committed_sources`) — imported by both the fixed pipeline and the Orchestrator Agent to avoid circular imports |
+| Source backup | `app/core/backup.py` (provider snapshot + poll), `app/core/backup_store.py` (SQLite metadata log) |
+| Writes & promotion | `app/api/migration.py` (`_promote_rows`, approve/reject, upsert-key guard, restore-point lookup, audit log) |
 | Read APIs | `app/api/abase.py`, `app/api/gds.py`, `app/api/report.py`, `app/api/reviewer.py`, `app/api/critic.py` |
 | Plumbing | `app/connectors/*` (pools), `app/core/llm.py` (Gemini client + failover), `app/core/mapping.py` (validation, coercion, config loader) |
 
-**Headline:** 3 true agents · 1 single-shot critic · 1 fallback · deterministic infrastructure.
+**Headline:** 3 always-on agents (+1 opt-in orchestrator) · 1 single-shot critic · 1 fallback · deterministic infrastructure.
 
 ---
 
@@ -149,10 +159,29 @@ One LLM call, no loop, no tools.
   - `gds_staging_experiments` — transient staging buffer (`data` JSONB, `status`, `risk_level`)
   - `migration_plans` — stores each run's `promotion_config`
   - `migration_audit_log` — append-only audit trail
+  - `migration_source_backups` — restore-point metadata per run (snapshot id, source host, row
+    counts per table); read back via `GET /api/migrate/restore-point/{trace_id}`
 
 Connection strings live in `backend/.env`. Passwords with special characters are percent-encoded
 and decoded by the shared `_create_pool()`. Pools are async (`asyncpg`), managed by the FastAPI
 lifespan.
+
+---
+
+## 4b. Pre-migration backup (restore point)
+
+Before any change, `_execute_migration()` calls `trigger_backup()` to snapshot the **source** DB —
+this is enterprise infrastructure, not agent logic, so the agent never reads or copies data rows; it
+only invokes the configured provider and records the returned snapshot id.
+
+- **Providers** (`BACKUP_PROVIDER` env var): `aws_rds` (RDS `CreateDBSnapshot` via boto3),
+  `supabase` (Management API), `webhook` (generic HTTP, for enterprise/Oracle backup managers), or
+  `none` (development only — logs a warning).
+- **Non-blocking by design.** If backup is unavailable (`none`, or the table isn't created yet) the
+  deterministic pipeline logs a warning and proceeds. The **Orchestrator Agent, by contrast, refuses
+  to migrate without a confirmed backup** (see §8) — a stricter posture for production.
+- **Metadata** is persisted both to `migration_source_backups` (Postgres) and a zero-setup local
+  SQLite log at `backend/data/backup_log.db` (`backup_store.py`), keyed by `trace_id`.
 
 ---
 
@@ -214,19 +243,35 @@ Every resolution writes an attributed event (`hitl_approved` / `hitl_excluded` /
 with the actor) to `migration_audit_log`, so the verification report can show who did what, when.
 
 A second gate (**Gate 1 — mapping review**) surfaces the *draft mapping* for human review, backed by
-the Mapping Critic's verdict: on `APPROVE` the pipeline auto-promotes clean records; on `FLAG`
-auto-promotion is skipped and every record is forced into HITL. A critic *failure* (LLM unavailable)
-is non-blocking, but a `FLAG` *verdict* is enforced.
+the Mapping Critic's verdict. The escalation rule is **severity-based**: auto-promotion is skipped and
+every record forced into HITL only when the critic returns `FLAG` **and** at least one finding is
+`error`-severity (a type mismatch or data-corruption/promotion-failure risk). Warning- and info-level
+findings are surfaced in the UI but **do not** block auto-promotion — clean rows still promote. A
+critic *failure* (LLM unavailable) is non-blocking.
 
 ---
 
-## 8. Orchestration (and why it isn't an agent — yet)
+## 8. Orchestration — two interchangeable drivers
 
-The end-to-end flow in `app/api/agent.py` is a **deterministic, linear pipeline**, not an
-orchestrator agent. This is intentional: for a known pipeline (ABASE → GDS) the sequence is fixed,
-so a hardcoded flow is correct and predictable. An orchestrator agent earns its place only when the
-workflow needs real branching — unknown schemas, or a critic-rejects-then-remap loop. That is the
-documented v2 direction.
+`_execute_migration()` in `app/api/agent.py` has two modes, selected by the `ORCHESTRATOR_AGENT`
+env var:
+
+- **Default — deterministic pipeline (`ORCHESTRATOR_AGENT=false`).** A fixed, linear sequence
+  (backup → mapping → stage → critic → auto-promote → cleanup). For a known pipeline (ABASE → GDS)
+  the order is fixed, so a hardcoded flow is correct, predictable, and cheap (no extra LLM turns).
+- **Opt-in — Orchestrator Agent (`ORCHESTRATOR_AGENT=true`).** `app/agents/orchestrator_agent.py`
+  is a true tool-calling agent (8 tools, up to 25 turns) that *reasons about each step* and decides
+  what to do next rather than following a script. It enforces the same safety invariants explicitly:
+  it **will not migrate without a confirmed backup** (`check_backup_status` must return
+  `confirmed=true`, else it stops), escalates **all** rows to HITL when the critic finds
+  error-severity issues, flags unusual runs (e.g. >50% of rows flagged), and can reason about
+  retrying a failed sub-agent once. Both modes call the same sub-agents and the same shared
+  `pipeline_helpers`, so they produce equivalent writes — the orchestrator simply makes the control
+  flow itself an agent decision.
+
+This is the realization of the former "v2 direction": the orchestrator earns its place when the
+workflow needs real branching (unknown schemas, retry loops, early escalation), while the
+deterministic path remains the safe, low-cost default.
 
 ---
 
@@ -255,4 +300,5 @@ roll back a single migration.
 | AI | Google Gemini (`google-genai` SDK) |
 | Data transform | pandas, numpy |
 | Frontends | Next.js / React (×3) |
-| Database | PostgreSQL (Supabase in the reference deployment) |
+| Database | PostgreSQL (Supabase in the reference deployment); SQLite for the local backup log |
+| Backup providers | AWS RDS (boto3), Supabase Management API, generic webhook |

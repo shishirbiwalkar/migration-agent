@@ -119,9 +119,12 @@ POST /api/report/<trace_id>
 - Model failover (`gemini-2.5-flash → 2.0-flash → 2.5-flash-lite`)
 - Three themed frontends (ABASE light, GDS dark, HITL console)
 
+**Recently added:**
+- Orchestrator Agent — opt-in agentic pipeline driver (`ORCHESTRATOR_AGENT=true`); the deterministic linear pipeline remains the default
+- Pre-migration source backup / restore point (AWS RDS, Supabase, webhook providers)
+
 **Not done (future):**
 - Docker Compose / containerized deployment
 - Automated test suite
 - Durable async queue (current async is in-process, doesn't survive restart)
-- Orchestrator agent (current pipeline is a fixed linear sequence)
 - Notification system (HITL review is pull-based, no email/Slack)

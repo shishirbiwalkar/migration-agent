@@ -634,7 +634,7 @@ async def run_migration_agent(
 
                     else:
                         result = {"status": "error", "error": f"Unknown tool: {name}. "
-                                  "Do not attempt DB writes — use only the 5 allowed tools."}
+                                  "Use only the 6 allowed tools."}
 
                 except Exception as exc:
                     result = {"status": "error",

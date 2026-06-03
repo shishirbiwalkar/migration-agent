@@ -63,7 +63,12 @@ async def run_reviewer(trace_id: str, scientist_name: str, body: RunRequest):
         pool = await get_gds_pool()
         tid  = uuid_mod.UUID(trace_id)
         config = await load_promotion_config(pool, tid)
-        staging_tbl = config.get("staging_table", "gds_staging_experiments")
+        staging_tbl = config.get("staging_table")
+        if not staging_tbl:
+            raise RuntimeError(
+                "promotion_config missing 'staging_table'. "
+                "Agent must discover and specify the target staging table."
+            )
 
         _NAME_FILTER = """(
             data->>'scientist_name' = $2

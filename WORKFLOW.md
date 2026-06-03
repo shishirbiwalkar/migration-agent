@@ -22,6 +22,16 @@ The end-to-end migration pipeline, step by step. Each run is identified by a `tr
 
 Optional body: `source_db_url`, `target_db_url`, `initiated_by`. Defaults to ABASE → GDS.
 
+> **Two drivers.** By default this stage runs as a fixed deterministic pipeline. Set
+> `ORCHESTRATOR_AGENT=true` to instead drive it with the **Orchestrator Agent** — a tool-calling
+> agent that reasons step-by-step, refuses to migrate without a confirmed backup, and escalates to
+> HITL on its own judgment. Both produce equivalent writes; the steps below describe the default path.
+
+0. **Back up the source (non-blocking).** Before any change, `trigger_backup()` snapshots the source
+   DB via the configured provider (`BACKUP_PROVIDER`: `aws_rds` / `supabase` / `webhook` / `none`).
+   The snapshot id and per-table row counts are recorded to `migration_source_backups` and a local
+   SQLite log. If backup is unavailable the deterministic pipeline logs a warning and proceeds (the
+   Orchestrator Agent stops instead). Inspect later via `GET /api/migrate/restore-point/{trace_id}`.
 1. **Run the Migration Agent (read-only).** It:
    - discovers the source and target schemas via `information_schema`
    - samples real rows to understand each column's meaning
@@ -33,9 +43,11 @@ Optional body: `source_db_url`, `target_db_url`, `initiated_by`. Defaults to ABA
 3. **Mark the source `migrating`.** Involved ABASE researchers are set to
    `migration_status='migrating'`. No source data is deleted here.
 4. **Store the plan.** `promotion_config` is saved to `migration_plans` for this `trace_id`.
-5. **Mapping Critic.** A single-shot LLM audit of the mapping → `APPROVE` / `FLAG`. A critic
-   *failure* (LLM unavailable) does not block the run. On a `FLAG` *verdict*, every staged row is
-   flipped to `risk_level='review'` and auto-promotion is skipped — all records go to human review.
+5. **Mapping Critic.** A single-shot LLM audit of the mapping → `APPROVE` / `FLAG` with per-finding
+   severity. A critic *failure* (LLM unavailable) does not block the run. Escalation is
+   **severity-based**: every staged row is flipped to `risk_level='review'` and auto-promotion
+   skipped **only** when the verdict is `FLAG` *and* there is at least one `error`-severity finding.
+   Warning/info findings are surfaced for the human but do **not** block auto-promotion.
 6. **Auto-promote clean records.** If the critic did not flag, records with `risk_level='auto'` are
    promoted to `gds_experiments` immediately — no human needed.
 7. **Delete fully-migrated sources.** After promotion commits, a researcher is hard-deleted from
@@ -97,6 +109,7 @@ produces an equivalent report.
 |---|---|
 | List completed runs | `GET /api/report/completed` |
 | Inspect pending review rows | `GET /api/migration/review?trace_id=…` |
+| Inspect the run's restore point | `GET /api/migrate/restore-point/{trace_id}` |
 | Roll back an approved run | `POST /api/migrate/rollback/{trace_id}` |
 | Re-run the mapping critic | `POST /api/critic/{trace_id}` |
 | Reset demo data | `python backend/scripts/reset_demo.py` |

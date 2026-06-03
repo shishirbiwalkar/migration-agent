@@ -40,10 +40,10 @@ def coerce(value):
 
 
 # ── Field-name candidates — agents may name columns differently ───────────────
-NAME_FIELDS   = ("scientist_name", "name", "scientist", "user_name", "researcher_name")
+NAME_FIELDS   = ("scientist_name", "gds_user_name", "name", "scientist", "user_name", "researcher_name")
 WELL_FIELDS   = ("well_position", "experiment_well_position", "well", "position")
 SIGNAL_FIELDS = ("signal", "experiment_signal", "raw_value", "value", "measurement")
-ROLE_FIELDS   = ("scientist_role", "role", "user_role", "department", "dept")
+ROLE_FIELDS   = ("scientist_role", "gds_user_role", "role", "user_role", "department", "dept")
 
 
 def pick_field(data: dict, candidates, default=None):

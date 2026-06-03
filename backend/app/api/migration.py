@@ -19,7 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 def _staging_table(config: dict) -> str:
-    return config.get("staging_table", "gds_staging_experiments")
+    staging = config.get("staging_table")
+    if not staging:
+        raise ValueError(
+            "promotion_config must include 'staging_table'. "
+            "Agent must discover and specify the target staging table name."
+        )
+    return staging
 
 
 async def _resolve_conflict_target(conn, table: str, proposed: list[str],
@@ -119,7 +125,7 @@ async def _promote_rows(
         data     = row_dict["data"] if isinstance(row_dict["data"], dict) \
                    else json_mod.loads(row_dict["data"])
 
-        # 1. Upsert entity (e.g. gds_users)
+        # 1. Upsert entity (agent maps source columns to target entity table)
         entity_cols = list(entity_map.values())
         try:
             entity_vals = [_coerce(data[src]) for src in entity_map.keys()]
@@ -145,7 +151,7 @@ async def _promote_rows(
         ent_row = await conn.fetchrow(insert_entity, *entity_vals)
         entity_id = ent_row[entity_pk]
 
-        # 2. Insert record (e.g. gds_experiments)
+        # 2. Insert record (agent maps source columns to target records table)
         _infra = {"trace_id", "approved_by", fk_col, "source_experiment_id"}
         filtered_map = {src: tgt for src, tgt in records_map.items() if tgt not in _infra}
         rec_cols = [fk_col] + list(filtered_map.values()) + ["trace_id", "approved_by"]
@@ -251,10 +257,10 @@ async def get_pending_runs():
     pool = await get_gds_pool()
 
     async with pool.acquire() as conn:
-        # Collect every staging table referenced by any migration plan (+ default).
+        # Collect every staging table referenced by any migration plan.
         # Different runs could in principle use different staging tables.
         plan_rows = await conn.fetch("SELECT plan_json FROM migration_plans")
-        staging_tables = {"gds_staging_experiments"}
+        staging_tables: set[str] = set()
         for pr in plan_rows:
             plan = json_mod.loads(pr["plan_json"]) if isinstance(pr["plan_json"], str) \
                    else pr["plan_json"]
@@ -263,17 +269,18 @@ async def get_pending_runs():
                 staging_tables.add(st)
 
         rows = []
-        for st in sorted(staging_tables):
-            try:
-                _validate_identifier(st, "staging_table")
-            except ValueError:
-                continue  # skip any unsafe table name from a malformed plan
-            rows += await conn.fetch(f"""
-                SELECT trace_id, data, status, risk_level, created_at
-                FROM   {st}
-                WHERE  status = 'pending' AND risk_level = 'review'
-                ORDER  BY created_at DESC
-            """)
+        if staging_tables:
+            for st in sorted(staging_tables):
+                try:
+                    _validate_identifier(st, "staging_table")
+                except ValueError:
+                    continue  # skip any unsafe table name from a malformed plan
+                rows += await conn.fetch(f"""
+                    SELECT trace_id, data, status, risk_level, created_at
+                    FROM   {st}
+                    WHERE  status = 'pending' AND risk_level = 'review'
+                    ORDER  BY created_at DESC
+                """)
 
     if not rows:
         return JSONResponse(content={"runs": []})
@@ -496,7 +503,7 @@ async def approve(trace_id: str, body: ApproveRequest, request: Request):
 
 @router.post("/reject/{trace_id}")
 async def reject(trace_id: str, request: Request):
-    """Reject staging — nothing reaches GDS production."""
+    """Reject staging — nothing reaches target production tables."""
     log = logging.LoggerAdapter(logger, {"trace_id": trace_id})
     pool = await get_gds_pool()
     tid  = uuid_mod.UUID(trace_id)
@@ -542,9 +549,9 @@ async def reject(trace_id: str, request: Request):
 async def rollback(trace_id: str, request: Request):
     """
     Rollback an approved migration:
-      - Deletes gds_experiments records for this trace
+      - Deletes records from the target records table for this trace
       - Marks staging rows as 'rolled_back'
-      - Does NOT delete gds_users (they may appear in other migrations)
+      - Does NOT delete entity records (they may appear in other migrations)
     """
     log = logging.LoggerAdapter(logger, {"trace_id": trace_id})
     pool = await get_gds_pool()
@@ -553,7 +560,13 @@ async def rollback(trace_id: str, request: Request):
     async with pool.acquire() as conn:
         config      = await _load_promotion_config(conn, tid)
         staging_tbl = _staging_table(config)
-        records_tbl = config.get("records_table", {}).get("name", "gds_experiments")
+        records_cfg = config.get("records_table", {})
+        if not records_cfg or not records_cfg.get("name"):
+            raise RuntimeError(
+                "promotion_config must include records_table.name. "
+                "Agent must discover and specify the target records table."
+            )
+        records_tbl = _validate_identifier(records_cfg["name"], "records_table.name")
 
         approved_count = await conn.fetchval(
             f"SELECT COUNT(*) FROM {records_tbl} WHERE trace_id=$1", tid)
@@ -584,6 +597,34 @@ async def rollback(trace_id: str, request: Request):
         "experiments_deleted": rows_deleted,
         "status":           "rolled_back",
     })
+
+
+# ── GET /api/migrate/restore-point/{trace_id} ────────────────────────────────
+
+@router.get("/restore-point/{trace_id}")
+async def get_restore_point(trace_id: str):
+    """
+    Returns metadata about the restore-point snapshot taken at the start of this run.
+    Shows row counts per table — does not return the full data (use POST /restore to apply it).
+    """
+    pool = await get_gds_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT backup_id, trace_id, source_host, row_count, created_at, "
+            "       tables_json FROM migration_source_backups WHERE trace_id=$1",
+            uuid_mod.UUID(trace_id),
+        )
+    if not row:
+        raise HTTPException(status_code=404,
+            detail=f"No restore point found for trace_id={trace_id}.")
+    d = dict(row)
+    d["trace_id"]   = str(d["trace_id"])
+    d["created_at"] = d["created_at"].isoformat()
+    d["trace_id"]   = str(d["trace_id"])
+    if d.get("metadata") and not isinstance(d["metadata"], dict):
+        d["metadata"] = json_mod.loads(d["metadata"])
+    return JSONResponse(content=d)
+
 
 
 # ── GET /api/migrate/audit/{trace_id} ────────────────────────────────────────

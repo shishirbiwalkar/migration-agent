@@ -147,8 +147,9 @@ For each issue, assign severity:
 - "info"    = minor note, not blocking
 
 VERDICT:
-- "APPROVE" if there are no error-level findings (warnings/info are acceptable to note)
-- "FLAG"    if there is ANY error-level finding, OR multiple serious warnings
+- "APPROVE" if there are no error-level findings (warnings/info are acceptable to note, and do NOT trigger FLAG)
+- "FLAG"    ONLY if there is at least one error-level finding that would cause data corruption or a promotion failure
+             Warnings and info findings must never cause a FLAG verdict — they are noted for the human but do not block auto-promotion
 
 Respond with ONLY valid JSON in exactly this shape:
 {

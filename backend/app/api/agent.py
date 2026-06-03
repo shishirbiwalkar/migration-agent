@@ -15,6 +15,13 @@ from app.agents import run_migration_agent, compute_schema_fingerprints, replay_
 from app.connectors import get_gds_pool, get_abase_pool
 from app.api.migration import auto_approve_clean_rows
 from app.core.mapping import validate_identifier as _validate_identifier
+from app.api.pipeline_helpers import (
+    write_to_staging      as _write_to_staging,
+    store_migration_plan  as _store_migration_plan,
+    mark_source_migrating as _mark_source_migrating,
+    force_all_to_review   as _force_all_to_review,
+    purge_committed_sources as _purge_committed_sources,
+)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
@@ -24,146 +31,11 @@ _background_tasks: set = set()
 
 
 class AgentRunRequest(BaseModel):
-    source_db_url: str | None = None  # default: ABASE_DATABASE_URL env var
-    target_db_url: str | None = None  # default: GDS_DATABASE_URL env var
+    source_db_url: str | None = None  # default: ABASE_DATABASE_URL env var (any source database supported)
+    target_db_url: str | None = None  # default: GDS_DATABASE_URL env var (any target database supported)
     initiated_by:  str        = "System"
 
 
-async def _write_to_staging(trace_id: str, records: list[dict], promotion_config: dict) -> int:
-    """Write agent-produced records to staging as JSONB — works for any migration schema."""
-    if not records:
-        return 0
-
-    staging_table = promotion_config.get("staging_table", "gds_staging_experiments")
-    insert_sql    = f"""
-        INSERT INTO {staging_table} (trace_id, data, risk_level, status)
-        VALUES ($1, $2, $3, 'pending')
-        ON CONFLICT DO NOTHING
-    """
-
-    def _safe_json(v):
-        if isinstance(v, UUID):          return str(v)
-        if hasattr(v, "isoformat"):      return v.isoformat()
-        if isinstance(v, np.integer):    return int(v)
-        if isinstance(v, np.floating):   return float(v)
-        if isinstance(v, np.ndarray):    return v.tolist()
-        return v
-
-    def _payload(r: dict) -> dict:
-        # Some agent transforms emit rows already shaped like the staging table itself
-        # (a nested 'data' dict plus trace_id/risk_level columns). Unwrap so the JSONB
-        # holds FLAT business fields — otherwise scientist_name/user_name end up buried
-        # under data.data, unreachable, and HITL can't group by scientist (shows one
-        # collective bucket instead of separate users).
-        src = r["data"] if isinstance(r.get("data"), dict) else r
-        return {k: _safe_json(v) for k, v in src.items()
-                if k not in ("risk_level", "trace_id", "data")}
-
-    pool = await get_gds_pool()
-    tid  = uuid.UUID(trace_id)
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.executemany(
-                insert_sql,
-                [
-                    (
-                        tid,
-                        json.dumps(_payload(r)),
-                        r.get("risk_level", "auto"),
-                    )
-                    for r in records
-                ],
-            )
-    return len(records)
-
-
-async def _store_migration_plan(trace_id: str, promotion_config: dict, initiated_by: str = "System") -> None:
-    """Persist the agent's promotion config for the approve endpoint to use."""
-    pool = await get_gds_pool()
-    tid  = uuid.UUID(trace_id)
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO migration_plans (trace_id, plan_json, initiated_by)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (trace_id) DO UPDATE
-                SET plan_json    = EXCLUDED.plan_json,
-                    initiated_by = EXCLUDED.initiated_by
-        """, tid, json.dumps(promotion_config), initiated_by)
-
-
-def _scientist_name(row: dict) -> str:
-    """Best-effort scientist name from a record/staging row (schema-agnostic)."""
-    return (row.get("scientist_name") or row.get("name")
-            or row.get("scientist") or row.get("user_name") or "")
-
-
-async def _mark_source_migrating(records: list[dict]) -> int:
-    """
-    Soft-delete safety: mark involved source scientists as 'migrating' instead of
-    deleting them. No source data is destroyed here. Best-effort — a source without
-    a migration_status column (any generic non-ABASE DB) is silently skipped.
-    """
-    names = sorted({_scientist_name(r) for r in records} - {""})
-    if not names:
-        return 0
-    abase_pool = await get_abase_pool()
-    async with abase_pool.acquire() as aconn:
-        result = await aconn.execute(
-            "UPDATE users SET migration_status='migrating' WHERE name = ANY($1::text[])",
-            names,
-        )
-    return int(result.split()[-1])
-
-
-async def _force_all_to_review(conn, trace_id: str, staging_table: str) -> int:
-    """
-    Mapping-critic enforcement: flip every still-'auto' staged row to 'review' so it
-    bypasses auto-promotion and lands in mandatory human review. After this, the
-    auto-promote step finds zero 'auto' rows and promotes nothing.
-    """
-    table = _validate_identifier(staging_table, "staging_table")
-    result = await conn.execute(f"""
-        UPDATE {table}
-        SET    risk_level = 'review'
-        WHERE  trace_id = $1 AND status = 'pending' AND risk_level = 'auto'
-    """, uuid.UUID(trace_id))
-    return int(result.split()[-1])
-
-
-async def _purge_committed_sources(trace_id: str, staging_table: str) -> tuple[int, list]:
-    """
-    Post-verification hard delete. Runs ONLY after auto-promotion has committed.
-    A source scientist is deleted from ABASE only if EVERY one of their staged rows
-    is 'auto_approved' — i.e. provably live in GDS production, with nothing pending,
-    flagged, or excluded. This is the only place source data is ever destroyed in
-    Stage 1, and only after the target transaction has committed.
-    """
-    table = _validate_identifier(staging_table, "staging_table")
-    gds_pool = await get_gds_pool()
-    async with gds_pool.acquire() as conn:
-        rows = await conn.fetch(f"""
-            SELECT COALESCE(data->>'scientist_name', data->>'name',
-                            data->>'scientist', data->>'user_name') AS sname,
-                   status
-            FROM   {table}
-            WHERE  trace_id = $1
-        """, uuid.UUID(trace_id))
-
-    by_scientist: dict = defaultdict(set)
-    for r in rows:
-        if r["sname"]:
-            by_scientist[r["sname"]].add(r["status"])
-
-    # Fully committed = every staged row reached production, none left behind.
-    committed = [s for s, statuses in by_scientist.items() if statuses == {"auto_approved"}]
-    if not committed:
-        return 0, []
-
-    abase_pool = await get_abase_pool()
-    async with abase_pool.acquire() as aconn:
-        result = await aconn.execute(
-            "DELETE FROM users WHERE name = ANY($1::text[])", committed)
-    return int(result.split()[-1]), committed
 
 
 async def _lookup_cached_mapping(fingerprint: str) -> dict | None:
@@ -245,13 +117,34 @@ def _resolve_urls(body: "AgentRunRequest") -> tuple[str, str]:
 async def _execute_migration(trace_id: str, source_url: str, target_url: str,
                              initiated_by: str) -> dict:
     """
-    The full pipeline, independent of how it was triggered (sync request or async job).
-    Step 1 obtains the mapping — replaying a cached one when the schema pair is unchanged
-    (no LLM), otherwise running the agent and caching the result. Steps 2–4b are the
-    deterministic write/critic/promote pipeline and are identical for both paths.
-    Raises RuntimeError on a fatal problem; callers decide how to surface it.
+    Entry point for both sync and async migration runs.
+    Delegates to the Orchestrator Agent when ORCHESTRATOR_AGENT=true,
+    otherwise runs the deterministic pipeline below.
     """
+    if os.getenv("ORCHESTRATOR_AGENT", "false").lower() == "true":
+        from app.agents.orchestrator_agent import run_orchestrator_agent
+        return await run_orchestrator_agent(trace_id, source_url, target_url, initiated_by)
+
     log = logging.LoggerAdapter(logger, {"trace_id": trace_id})
+
+    # ── Step 0: Source backup — infrastructure code, non-blocking ────────────
+    # Backup is enterprise infrastructure, not agent logic. Migration proceeds
+    # even if backup is unavailable (BACKUP_PROVIDER=none or table not yet created).
+    try:
+        from app.core.backup import trigger_backup
+        from app.core.backup_store import save_backup
+        import urllib.parse as _urlparse
+        backup = await trigger_backup(source_url, trace_id)
+        parsed = _urlparse.urlparse(source_url)
+        source_host = parsed.hostname or source_url.split("@")[-1].split("/")[0]
+        await save_backup(
+            trace_id=trace_id, source_host=source_host,
+            provider=backup["provider"], snapshot_id=backup.get("snapshot_id"),
+            status=backup["status"], metadata=backup.get("metadata", {}),
+        )
+        log.info("Backup: provider=%s status=%s", backup["provider"], backup["status"])
+    except Exception as e:
+        log.warning("Backup skipped (non-blocking): %s", e)
 
     # ── Step 1: Obtain the mapping (cache replay, or agent + cache store) ──────
     fp = await compute_schema_fingerprints(source_url, target_url)
@@ -299,14 +192,24 @@ async def _execute_migration(trace_id: str, source_url: str, target_url: str,
     try:
         from app.agents.critic_agent import run_critic_agent
         mapping_review = await run_critic_agent(trace_id)
-        verdict = (mapping_review or {}).get("verdict")
-        critic_flagged = verdict == "FLAG"
-        log.info("Mapping critic verdict: %s", verdict)
+        verdict  = (mapping_review or {}).get("verdict")
+        findings = (mapping_review or {}).get("findings", [])
+        # Only force all rows to HITL when there is at least one genuine error-severity
+        # finding (type mismatch, data corruption risk). Warnings alone do not escalate —
+        # they are surfaced in the UI but clean rows still auto-promote.
+        has_errors = any(f.get("severity") == "error" for f in findings)
+        critic_flagged = verdict == "FLAG" and has_errors
+        log.info("Mapping critic verdict: %s (error_findings=%s)", verdict, has_errors)
     except Exception as e:
         log.warning("Mapping critic skipped: %s", e)
 
     # ── Step 3c: Enforce a FLAG — force all rows to mandatory review ──────────
-    staging_table = promotion_config.get("staging_table", "gds_staging_experiments")
+    staging_table = promotion_config.get("staging_table")
+    if not staging_table:
+        raise RuntimeError(
+            "promotion_config must include 'staging_table'. "
+            "Agent must discover and specify the target staging table."
+        )
     if critic_flagged:
         gds_pool = await get_gds_pool()
         async with gds_pool.acquire() as conn:

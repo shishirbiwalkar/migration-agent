@@ -22,7 +22,9 @@ mapping. ABASE → GDS is simply the default when no URLs are supplied.
 | **Migration Agent** | 🟢 Agentic (tool loop, 5 tools, self-repair) | Discovers schemas, maps columns, transforms data, screens for anomalies |
 | **Review Resolution Agent** | 🟢 Agentic (tool loop, 5 tools) | Turns a researcher's plain-English message into approve/exclude decisions |
 | **Verification Agent** | 🟢 Agentic (tool loop, 8 read-only tools) | Independently audits a completed migration and writes the verification report |
-| **Mapping Critic** | 🟡 Single LLM call | Reviews the proposed mapping before any data moves (proposer–critic) |
+| **Orchestrator Agent** *(opt-in)* | 🟢 Agentic (tool loop, 8 tools) | Reasons over the whole pipeline and delegates to the sub-agents; enable with `ORCHESTRATOR_AGENT=true` |
+| **Mapping Critic** | 🟡 Single LLM call | Reviews the proposed mapping before any data moves (proposer–critic); severity-based escalation |
+| Source backup | ⚪ Deterministic infra | Pre-migration snapshot of the source DB (AWS RDS / Supabase / webhook) before any change |
 | Orchestration & writes | ⚪ Deterministic code | All staging/promotion/audit writes, the upsert-key guard, the API |
 
 ### Documentation
