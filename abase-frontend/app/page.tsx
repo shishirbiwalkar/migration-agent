@@ -137,95 +137,6 @@ function TraceEntry({ step }: { step: TraceStep }) {
 
 // ── Confirmation Modal ────────────────────────────────────────────────────────
 
-function ConfirmModal({ userCount, wellCount, onCancel, onConfirm }: {
-  userCount: number
-  wellCount: number
-  onCancel:  () => void
-  onConfirm: () => void
-}) {
-  const [input, setInput] = useState('')
-  const canConfirm = input.trim() === 'MIGRATE'
-
-  return (
-    <div style={{
-      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999,
-    }}>
-      <div style={{ ...raised, background: S.panelBg, fontFamily: S.font, width: 440 }}>
-
-        {/* Title bar */}
-        <div style={{
-          background: S.danger, color: '#fff', padding: '4px 8px',
-          display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, fontWeight: 'bold',
-        }}>
-          <span>⚠</span>
-          <span>Authorize Migration Operation — ABASE System</span>
-        </div>
-
-        {/* Body */}
-        <div style={{ padding: '16px 20px' }}>
-          <div style={{ ...sunken, background: '#fff8f0', padding: '10px 14px', marginBottom: 14, borderLeft: `4px solid ${S.danger}` }}>
-            <p style={{ fontSize: 12, fontWeight: 'bold', color: S.danger, margin: '0 0 6px' }}>
-              RESTRICTED OPERATION — ADMINISTRATOR AUTHORIZATION REQUIRED
-            </p>
-            <p style={{ fontSize: 11, color: '#333', margin: 0, lineHeight: 1.6 }}>
-              You are about to initiate a full database migration from ABASE to GDS.
-              This operation is logged, audited, and cannot be undone.
-            </p>
-          </div>
-
-          <p style={{ fontSize: 11, color: '#000', margin: '0 0 6px', fontWeight: 'bold' }}>Operation scope:</p>
-          <table style={{ fontSize: 11, color: '#333', marginBottom: 14, borderCollapse: 'collapse' }}>
-            <tbody>
-              {[
-                ['Source system',   'ABASE (us-west-2)'],
-                ['Target system',   'GDS   (us-east-2)'],
-                ['Scientist records', `${userCount} records`],
-                ['Well experiments',  `${wellCount} records`],
-                ['Anomaly detection', 'Mean ± 2σ per signal column'],
-                ['Audit trail',       'Enabled — trace_id logged'],
-              ].map(([k, v]) => (
-                <tr key={k}>
-                  <td style={{ padding: '1px 16px 1px 0', color: '#555' }}>• {k}</td>
-                  <td style={{ fontFamily: S.mono, fontSize: 10, color: '#000' }}>{v}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          <p style={{ fontSize: 11, color: '#000', margin: '0 0 4px' }}>
-            Type <strong>MIGRATE</strong> in the field below to authorize:
-          </p>
-          <input
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            placeholder="Type MIGRATE to confirm"
-            autoFocus
-            style={{
-              ...sunken,
-              fontFamily: S.mono, fontSize: 13, fontWeight: 'bold',
-              width: '100%', padding: '5px 8px', boxSizing: 'border-box',
-              background: '#fff', color: canConfirm ? S.danger : '#333',
-              outline: 'none', letterSpacing: 2, marginBottom: 16,
-            }}
-          />
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-            <button style={classicBtn} onClick={onCancel}>Cancel</button>
-            <button
-              style={{ ...dangerBtn, opacity: canConfirm ? 1 : 0.45, cursor: canConfirm ? 'pointer' : 'not-allowed' }}
-              disabled={!canConfirm}
-              onClick={onConfirm}
-            >
-              Authorize Migration
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 type View = 'scientists' | 'admin'
@@ -240,7 +151,6 @@ export default function AbaseAdmin() {
   const [selected,     setSelected]     = useState<AbaseUser | null>(null)
   const [experiments,  setExperiments]  = useState<Experiment[]>([])
   const [expLoading,   setExpLoading]   = useState(false)
-  const [showConfirm,  setShowConfirm]  = useState(false)
   const [agentPhase,   setAgentPhase]   = useState<'idle' | 'loading' | 'playing' | 'done' | 'error'>('idle')
   const [allSteps,     setAllSteps]     = useState<TraceStep[]>([])
   const [visible,      setVisible]      = useState<TraceStep[]>([])
@@ -304,29 +214,6 @@ export default function AbaseAdmin() {
     setTimeout(tick, 500)
   }
 
-  const runMigration = async () => {
-    setShowConfirm(false)
-    setAgentPhase('loading')
-    setAllSteps([]); setVisible([]); setTraceId(null); setAgentResult(null); setErrorMsg('')
-    setStatusMsg('Initializing migration agent...')
-    try {
-      const res = await fetch(`${API}/api/agent/run`, { method: 'POST' })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error(body.detail ?? `Server ${res.status}`)
-      }
-      const data = await res.json()
-      const steps = toTraceSteps(data.reasoning_trace ?? [])
-      playback(steps, data.trace_id, {
-        staged_row_count: data.staged_row_count,
-        auto_approved:    data.auto_approved,
-        pending_review:   data.pending_review,
-      })
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Unknown error'
-      setErrorMsg(msg); setAgentPhase('error'); setStatusMsg(`ERROR: ${msg}`)
-    }
-  }
 
   const filtered = users.filter(u =>
     !search ||
@@ -579,17 +466,8 @@ export default function AbaseAdmin() {
                     </tbody>
                   </table>
 
-                  <div style={{ borderTop: `2px solid ${S.borderDark}`, paddingTop: 10, display: 'flex', alignItems: 'center', gap: 16 }}>
-                    <button
-                      style={{ ...dangerBtn, opacity: isRunning ? 0.5 : 1, cursor: isRunning ? 'not-allowed' : 'pointer' }}
-                      disabled={isRunning}
-                      onClick={() => setShowConfirm(true)}
-                    >
-                      {isRunning ? '▶ Migration In Progress...' : '▶  Initiate Migration to GDS'}
-                    </button>
-                    <span style={{ fontSize: 10, color: '#888' }}>
-                      This will run the AI agent against all {users.length} scientists.
-                    </span>
+                  <div style={{ borderTop: `2px solid ${S.borderDark}`, paddingTop: 10, fontSize: 10, color: '#666', fontStyle: 'italic' }}>
+                    💡 Migration is now managed from the HITL Console (http://localhost:3000)
                   </div>
                 </div>
               </div>
@@ -666,15 +544,6 @@ export default function AbaseAdmin() {
         <span style={{ color: '#666' }}>ABASE v2.4 · PROD · {users.length} scientists · {totalWells} wells · Connected</span>
       </div>
 
-      {/* ── Confirmation Modal ── */}
-      {showConfirm && (
-        <ConfirmModal
-          userCount={users.length}
-          wellCount={totalWells}
-          onCancel={() => setShowConfirm(false)}
-          onConfirm={runMigration}
-        />
-      )}
     </div>
   )
 }

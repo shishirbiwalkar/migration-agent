@@ -437,13 +437,14 @@ function AuditView() {
   )
 }
 
-// ── RUN MIGRATION MODAL ──
+// ── RUN MIGRATION MODAL (Setup) ──
 function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const [source, setSource] = useState('ABASE')
   const [target, setTarget] = useState('GDS')
+  const [showConfirm, setShowConfirm] = useState(false)
   const [running, setRunning] = useState(false)
 
-  const handleRun = async () => {
+  const handleConfirm = async () => {
     setRunning(true)
     try {
       const res = await fetch(`${API}/api/agent/run/async`, {
@@ -452,23 +453,30 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
         body: JSON.stringify({
           source_db_url: source === 'ABASE' ? undefined : source,
           target_db_url: target === 'GDS' ? undefined : target,
-          initiated_by: 'HITL Console User',
+          initiated_by: 'HITL Console',
         }),
       })
-      if (!res.ok) throw new Error('Failed to start migration')
+      if (!res.ok) {
+        const err = await res.text()
+        throw new Error(`HTTP ${res.status}: ${err}`)
+      }
       onSuccess()
       onClose()
     } catch (e) {
-      console.error('Error:', e)
+      alert(`Error: ${e instanceof Error ? e.message : 'Failed to start migration'}`)
     } finally {
       setRunning(false)
     }
   }
 
+  if (showConfirm) {
+    return <MigrationConfirmModal source={source} target={target} running={running} onConfirm={handleConfirm} onCancel={() => setShowConfirm(false)} />
+  }
+
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg p-8 max-w-md w-full">
-        <h2 className="text-2xl font-bold text-gray-900 mb-6">Run New Migration</h2>
+        <h2 className="text-2xl font-bold text-gray-900 mb-6">Configure Migration</h2>
 
         <div className="space-y-6">
           <div>
@@ -481,6 +489,7 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
               <option>ABASE (us-west-2)</option>
               <option>Custom...</option>
             </select>
+            <p className="text-xs text-gray-500 mt-1">Read-only source system</p>
           </div>
 
           <div>
@@ -493,6 +502,7 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
               <option>GDS (us-east-2)</option>
               <option>Custom...</option>
             </select>
+            <p className="text-xs text-gray-500 mt-1">Target system for migration</p>
           </div>
 
           <div className="space-y-2">
@@ -514,12 +524,120 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
               Cancel
             </button>
             <button
-              onClick={handleRun}
+              onClick={() => setShowConfirm(true)}
+              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
+            >
+              Next: Authorize
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── MIGRATION CONFIRM MODAL (requires MIGRATE) ──
+function MigrationConfirmModal({
+  source,
+  target,
+  running,
+  onConfirm,
+  onCancel,
+}: {
+  source: string
+  target: string
+  running: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const [input, setInput] = useState('')
+  const canConfirm = input.trim() === 'MIGRATE'
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg w-full max-w-md overflow-hidden">
+
+        {/* Header */}
+        <div className="bg-red-600 text-white px-6 py-4 flex items-center gap-3">
+          <AlertTriangle size={20} />
+          <h2 className="text-lg font-bold">Authorize Migration Operation</h2>
+        </div>
+
+        {/* Body */}
+        <div className="p-6 space-y-6">
+
+          {/* Warning Box */}
+          <div className="bg-red-50 border-l-4 border-red-600 p-4">
+            <p className="text-sm font-bold text-red-700 mb-2">RESTRICTED OPERATION — ADMINISTRATOR AUTHORIZATION REQUIRED</p>
+            <p className="text-sm text-red-900">You are about to initiate a full database migration. This operation is logged, audited, and cannot be undone.</p>
+          </div>
+
+          {/* Operation Scope */}
+          <div>
+            <p className="text-sm font-bold text-gray-900 mb-3">Operation Scope:</p>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-gray-600">• Source system</span>
+                <span className="font-mono text-gray-900">{source}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">• Target system</span>
+                <span className="font-mono text-gray-900">{target}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">• Schema discovery</span>
+                <span className="font-mono text-gray-900">Automatic</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">• Anomaly detection</span>
+                <span className="font-mono text-gray-900">Mean ± 2σ</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">• Audit trail</span>
+                <span className="font-mono text-gray-900">Enabled</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Confirmation Input */}
+          <div>
+            <p className="text-sm text-gray-700 mb-2">
+              Type <strong>MIGRATE</strong> to authorize:
+            </p>
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Type MIGRATE to confirm"
+              autoFocus
+              className={`w-full px-3 py-2 border-2 rounded-lg font-mono text-lg tracking-wider transition ${
+                canConfirm
+                  ? 'border-red-600 bg-white text-red-600'
+                  : 'border-gray-300 bg-gray-50 text-gray-600'
+              }`}
+            />
+          </div>
+
+          {/* Buttons */}
+          <div className="flex gap-3 pt-4">
+            <button
+              onClick={onCancel}
               disabled={running}
-              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-lg font-medium transition flex items-center justify-center gap-2"
+              className="flex-1 px-4 py-2 border border-gray-300 rounded-lg font-medium text-gray-700 hover:bg-gray-50 transition disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onConfirm}
+              disabled={!canConfirm || running}
+              className={`flex-1 px-4 py-2 rounded-lg font-bold text-white transition flex items-center justify-center gap-2 ${
+                canConfirm && !running
+                  ? 'bg-red-600 hover:bg-red-700 cursor-pointer'
+                  : 'bg-gray-300 cursor-not-allowed opacity-50'
+              }`}
             >
               {running && <Loader2 size={18} className="animate-spin" />}
-              {running ? 'Running...' : 'Run Migration'}
+              {running ? 'Starting...' : 'Authorize Migration'}
             </button>
           </div>
         </div>
