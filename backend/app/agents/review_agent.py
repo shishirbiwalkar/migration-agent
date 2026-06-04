@@ -300,6 +300,57 @@ async def _tool_exclude_all_wells(
             "note": f"All {count} pending wells for '{scientist_name}' excluded."}
 
 
+# ── Batch tool: get_all_pending_wells ────────────────────────────────────────
+
+async def _tool_get_all_pending_wells(
+    pool: asyncpg.Pool, tid: uuid_mod.UUID, config: dict
+) -> dict:
+    """Return every flagged scientist and their pending wells in one shot."""
+    staging_tbl = config.get("staging_table", "gds_staging_experiments")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT staging_id, data, risk_level, status
+            FROM   {staging_tbl}
+            WHERE  trace_id = $1 AND risk_level = 'review'
+            ORDER  BY data->>'scientist_name', staging_id
+        """, tid)
+
+    by_scientist: dict = {}
+    for r in rows:
+        data       = r["data"] if isinstance(r["data"], dict) else json.loads(r["data"])
+        name       = (data.get("scientist_name") or data.get("user_name") or "unknown")
+        well_pos   = pick_field(data, WELL_FIELDS, "?")
+        signal     = pick_field(data, SIGNAL_FIELDS)
+        entry = {
+            "staging_id":    r["staging_id"],
+            "well_position": well_pos,
+            "signal":        signal,
+            "status":        r["status"],
+        }
+        by_scientist.setdefault(name, []).append(entry)
+
+    scientists = []
+    for name, wells in by_scientist.items():
+        pending  = [w for w in wells if w["status"] == "pending"]
+        excluded = [w for w in wells if w["status"] == "excluded"]
+        approved = [w for w in wells if w["status"] in ("approved", "auto_approved")]
+        scientists.append({
+            "scientist_name":  name,
+            "pending_count":   len(pending),
+            "excluded_count":  len(excluded),
+            "approved_count":  len(approved),
+            "wells":           wells,
+        })
+
+    total_pending = sum(s["pending_count"] for s in scientists)
+    return {
+        "status":        "success",
+        "total_pending": total_pending,
+        "scientists":    scientists,
+        "note":          "Use staging_id to act on specific wells. Use scientist_name in approve_all_wells / exclude_all_wells.",
+    }
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are the Review Resolution Agent for a scientific data migration pipeline.
@@ -556,4 +607,189 @@ async def run_review_agent(
         "actions_taken":  actions_taken,
         "turns_used":     turns_used,
         "reasoning_trace": trace,
+    }
+
+
+# ── Batch agent ───────────────────────────────────────────────────────────────
+
+BATCH_SYSTEM_PROMPT = """You are the Review Resolution Agent for a scientific data migration pipeline.
+
+You see ALL flagged scientists and their wells at once. The admin types one plain-English instruction
+describing what needs to happen across any number of scientists.
+
+STEP 1 — Always call get_all_pending_wells first to see the full picture.
+
+STEP 2 — Interpret the admin's instruction. Examples:
+  "Remove Chen_L's wells"                     → exclude_all_wells for Chen_L
+  "Singh_A and Gupta_P don't want their data" → exclude_all_wells for Singh_A, then Gupta_P
+  "Approve everyone except Lee_H"             → approve_all_wells for every scientist except Lee_H; exclude_all_wells for Lee_H
+  "Remove B03 from Chen_L"                    → exclude_well for Chen_L's B03 staging_id
+  "Approve all"                               → approve_all_wells for every scientist with pending wells
+  "Remove all flagged data"                   → exclude_all_wells for every scientist
+
+STEP 3 — Act. Use approve_all_wells / exclude_all_wells for whole-scientist actions.
+Use approve_well / exclude_well for specific well positions (pass the staging_id).
+scientist_name must match exactly what get_all_pending_wells returned.
+
+STEP 4 — After acting, call get_all_pending_wells again to confirm the final state.
+
+STEP 5 — Write a clean summary:
+RESOLUTION SUMMARY
+Actions taken:
+• [Scientist name]: [what was done] ([well count] wells)
+• ...
+Total approved: X  |  Total excluded: Y
+"""
+
+BATCH_TOOL_DEFINITIONS = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="get_all_pending_wells",
+        description="Load all flagged scientists and their wells for this migration run. Always call this first.",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="approve_all_wells",
+        description="Approve all pending wells for a scientist.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"scientist_name": types.Schema(type=types.Type.STRING)},
+            required=["scientist_name"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="exclude_all_wells",
+        description="Exclude all pending wells for a scientist.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"scientist_name": types.Schema(type=types.Type.STRING)},
+            required=["scientist_name"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="approve_well",
+        description="Approve a single well by staging_id.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"staging_id": types.Schema(type=types.Type.INTEGER)},
+            required=["staging_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="exclude_well",
+        description="Exclude a single well by staging_id.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"staging_id": types.Schema(type=types.Type.INTEGER)},
+            required=["staging_id"],
+        ),
+    ),
+])
+
+
+async def run_batch_review_agent(
+    trace_id:    str,
+    message:     str,
+    approved_by: str = "Review Resolution Agent",
+) -> dict:
+    """
+    One agent, one instruction, acts across ALL flagged scientists at once.
+    Admin types plain English — the agent figures out who to approve/exclude.
+    """
+    pool   = await get_gds_pool()
+    tid    = uuid_mod.UUID(trace_id)
+    config = await load_promotion_config(pool, tid)
+    client = get_client()
+
+    actions_taken: list[dict] = []
+
+    contents: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part(text=(
+            f"Migration trace: {trace_id}\n\n"
+            f"Admin instruction:\n\"{message}\"\n\n"
+            f"Start by loading all pending wells, then act on the instruction."
+        ))])
+    ]
+
+    _cfg = types.GenerateContentConfig(
+        system_instruction=BATCH_SYSTEM_PROMPT,
+        tools=[BATCH_TOOL_DEFINITIONS],
+        temperature=0.1,
+    )
+
+    final_text = ""
+
+    for _ in range(MAX_TURNS):
+        response = await generate_with_backoff(client, contents=contents, config=_cfg, model=_MODEL)
+
+        if not response.candidates:
+            break
+
+        candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            break
+
+        contents.append(types.Content(role="model", parts=candidate.content.parts))
+        tool_calls = [p for p in candidate.content.parts if p.function_call]
+
+        if not tool_calls:
+            final_text = " ".join(p.text for p in candidate.content.parts if p.text).strip()
+            break
+
+        tool_results = []
+        for part in tool_calls:
+            fn, args = part.function_call, dict(part.function_call.args or {})
+            name = fn.name
+
+            try:
+                if name == "get_all_pending_wells":
+                    result = await _tool_get_all_pending_wells(pool, tid, config)
+
+                elif name == "approve_all_wells":
+                    sname  = args["scientist_name"]
+                    result = await _tool_approve_all_wells(pool, tid, sname, config, approved_by)
+                    if result["status"] == "success":
+                        n = result.get("approved_count", 0)
+                        actions_taken.append({"scientist": sname, "action": "approved_all", "count": n})
+                        if n:
+                            await _log_review_audit(pool, tid, "hitl_approved", approved_by, promoted=n)
+
+                elif name == "exclude_all_wells":
+                    sname  = args["scientist_name"]
+                    result = await _tool_exclude_all_wells(pool, tid, sname, config)
+                    if result["status"] == "success":
+                        n = result.get("excluded_count", 0)
+                        actions_taken.append({"scientist": sname, "action": "excluded_all", "count": n})
+                        if n:
+                            await _log_review_audit(pool, tid, "hitl_excluded", approved_by, excluded=n)
+
+                elif name == "approve_well":
+                    sid    = int(args["staging_id"])
+                    result = await _tool_approve_well(pool, sid, tid, config, approved_by)
+                    if result["status"] == "success":
+                        actions_taken.append({"action": "approved", "staging_id": sid,
+                                              "well_position": result.get("well_position")})
+                        await _log_review_audit(pool, tid, "hitl_approved", approved_by, promoted=1)
+
+                elif name == "exclude_well":
+                    sid    = int(args["staging_id"])
+                    result = await _tool_exclude_well(pool, sid, config)
+                    if result["status"] == "success":
+                        actions_taken.append({"action": "excluded", "staging_id": sid})
+                        await _log_review_audit(pool, tid, "hitl_excluded", approved_by, excluded=1)
+
+                else:
+                    result = {"status": "error", "error": f"Unknown tool: {name}"}
+
+            except Exception as exc:
+                result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+            tool_results.append(types.Part(function_response=types.FunctionResponse(
+                name=name, response=result)))
+
+        contents.append(types.Content(role="user", parts=tool_results))
+
+    return {
+        "trace_id":     trace_id,
+        "result":       final_text,
+        "actions_taken": actions_taken,
     }

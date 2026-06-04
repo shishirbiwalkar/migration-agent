@@ -93,12 +93,25 @@ async def _promote_rows(
         return 0
 
     entity_tbl   = _validate_identifier(entity_cfg["name"],        "entity_table.name")
-    entity_map   = entity_cfg["column_map"]
-    upsert_key   = entity_cfg["upsert_key"]
     entity_pk    = _validate_identifier(entity_cfg["pk"],          "entity_table.pk")
+    # The entity PK is a DB-generated UUID (fetched via RETURNING below). It must NEVER be
+    # written from staged source data: a non-deterministic agent run sometimes maps
+    # `pk -> pk` and emits a synthetic numeric value, which fails on the UUID column with a
+    # DataError and aborts auto-promotion. Strip the PK (and other infra-managed columns)
+    # from the entity map, mirroring the records-side filter further down.
+    entity_map   = {src: tgt for src, tgt in entity_cfg["column_map"].items()
+                    if tgt not in (entity_cfg["pk"], "trace_id", "approved_by")}
+    upsert_key   = entity_cfg["upsert_key"]
 
     if upsert_key in entity_map:
         upsert_key = entity_map[upsert_key]
+    # An auto-generated PK can never serve as a dedup key (every insert mints a fresh UUID,
+    # so ON CONFLICT(pk) never matches → duplicate entities). If the agent proposed the PK,
+    # fall back to the real natural unique key discovered from the staged column map.
+    if upsert_key == entity_pk:
+        _natural = next((tgt for tgt in entity_map.values() if tgt != entity_pk), None)
+        if _natural:
+            upsert_key = _natural
     _validate_identifier(upsert_key, "entity_table.upsert_key")
     for col in entity_map.values():
         _validate_identifier(col, f"entity_table.column_map value '{col}'")

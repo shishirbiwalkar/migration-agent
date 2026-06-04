@@ -61,8 +61,39 @@ export default function HITLConsole() {
         fetch(`${API}/api/migrate/pending`),
         fetch(`${API}/api/report/completed`),
       ])
-      const pending = await pendingRes.json()
-      setMigrations(pending.runs || [])
+      const pendingData   = await pendingRes.json()
+      const completedData = await completedRes.json()
+
+      const pendingRuns: MigrationRun[] = (pendingData.runs || []).map((r: any) => ({
+        trace_id:     r.trace_id,
+        source:       'ABASE',
+        target:       'GDS',
+        status:       'review_pending' as MigrationStatus,
+        started_at:   r.created_at,
+        total_rows:   r.total_pending + (r.auto_approved || 0),
+        auto_approved: r.auto_approved || 0,
+        flagged:      r.total_pending,
+        pending:      r.total_pending,
+        scientists:   r.scientists || [],
+      }))
+
+      const completedRuns: MigrationRun[] = (completedData.runs || []).map((r: any) => ({
+        trace_id:     r.trace_id,
+        source:       'ABASE',
+        target:       'GDS',
+        status:       r.needs_review > 0 ? 'review_pending' as MigrationStatus : 'completed' as MigrationStatus,
+        started_at:   r.completed_at,
+        total_rows:   r.total_rows,
+        auto_approved: r.auto_approved,
+        flagged:      r.needs_review,
+        pending:      r.needs_review,
+        scientists:   [],
+      }))
+
+      // Merge: pending runs take priority; don't duplicate by trace_id
+      const pendingIds = new Set(pendingRuns.map(r => r.trace_id))
+      const merged = [...pendingRuns, ...completedRuns.filter(r => !pendingIds.has(r.trace_id))]
+      setMigrations(merged)
     } catch (e) {
       console.error('Error fetching migrations:', e)
     } finally {
@@ -365,9 +396,12 @@ function MigrationCard({ migration }: { migration: MigrationRun }) {
       </div>
 
       {migration.status === 'review_pending' && migration.flagged > 0 && (
-        <button className="w-full px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded font-medium text-sm transition">
+        <a
+          href={`/review?trace_id=${migration.trace_id}`}
+          className="block w-full px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded font-medium text-sm transition text-center"
+        >
           Review {migration.flagged} Flagged Rows
-        </button>
+        </a>
       )}
     </div>
   )
@@ -398,19 +432,28 @@ function MigrationsView({ migrations }: { migrations: MigrationRun[] }) {
 // ── REVIEWS VIEW ──
 function ReviewsView({ migrations }: { migrations: MigrationRun[] }) {
   const safeData = migrations || []
-  const flaggedCount = safeData.reduce((sum, m) => sum + (m.flagged || 0), 0)
+  const pending = safeData.filter(m => m.status === 'review_pending' && m.flagged > 0)
   return (
-    <div className="p-6">
-      {flaggedCount > 0 ? (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-bold text-gray-900 mb-4">{flaggedCount} Rows Pending Review</h3>
-          <p className="text-gray-600">Review queue implementation coming soon</p>
+    <div className="p-6 space-y-4">
+      {pending.length > 0 ? pending.map(m => (
+        <div key={m.trace_id} className="bg-white rounded-lg border border-yellow-200 p-5 flex items-center justify-between gap-4">
+          <div>
+            <p className="font-mono text-sm text-gray-500 mb-1">{m.trace_id.slice(0, 8)}…</p>
+            <p className="text-lg font-bold text-gray-900">{m.flagged} wells flagged for review</p>
+            <p className="text-sm text-gray-500">{m.scientists?.map(s => s.name).join(', ')}</p>
+          </div>
+          <a
+            href={`/review?trace_id=${m.trace_id}`}
+            className="shrink-0 px-5 py-2.5 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg font-medium text-sm transition"
+          >
+            Open Review →
+          </a>
         </div>
-      ) : (
+      )) : (
         <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
           <CheckCircle2 size={48} className="mx-auto text-green-300 mb-4" />
           <p className="text-gray-600 text-lg">No pending reviews</p>
-          <p className="text-gray-500">All rows have been approved</p>
+          <p className="text-gray-500">All flagged rows have been resolved</p>
         </div>
       )}
     </div>
@@ -419,12 +462,40 @@ function ReviewsView({ migrations }: { migrations: MigrationRun[] }) {
 
 // ── REPORTS VIEW ──
 function ReportsView() {
+  const [runs, setRuns] = useState<{ trace_id: string; completed_at: string; auto_approved: number; needs_review: number }[]>([])
+
+  useEffect(() => {
+    fetch(`${API}/api/report/completed`)
+      .then(r => r.json())
+      .then(d => setRuns(d.runs || []))
+      .catch(() => {})
+  }, [])
+
   return (
-    <div className="p-6">
-      <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
-        <FileText size={48} className="mx-auto text-gray-300 mb-4" />
-        <p className="text-gray-600">Reports view coming soon</p>
-      </div>
+    <div className="p-6 space-y-4">
+      {runs.length > 0 ? runs.map(r => (
+        <div key={r.trace_id} className="bg-white rounded-lg border border-gray-200 p-5 flex items-center justify-between gap-4">
+          <div>
+            <p className="font-mono text-sm text-gray-500 mb-1">{r.trace_id.slice(0, 8)}…</p>
+            <p className="text-sm text-gray-700">
+              Auto-approved: <span className="font-bold text-green-700">{r.auto_approved}</span>
+              {' · '}
+              Review: <span className="font-bold text-yellow-700">{r.needs_review}</span>
+            </p>
+          </div>
+          <a
+            href={`/report?trace_id=${r.trace_id}`}
+            className="shrink-0 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium text-sm transition"
+          >
+            Generate Report →
+          </a>
+        </div>
+      )) : (
+        <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
+          <FileText size={48} className="mx-auto text-gray-300 mb-4" />
+          <p className="text-gray-600">No completed migration runs yet</p>
+        </div>
+      )}
     </div>
   )
 }
@@ -445,11 +516,14 @@ function AuditView() {
 function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const [source, setSource] = useState('ABASE')
   const [target, setTarget] = useState('GDS')
-  const [showConfirm, setShowConfirm] = useState(false)
-  const [running, setRunning] = useState(false)
+  const [phase, setPhase] = useState<'config' | 'confirm' | 'running' | 'done' | 'error'>('config')
+  const [statusMsg, setStatusMsg] = useState('')
+  const [result, setResult] = useState<any>(null)
+  const [errorMsg, setErrorMsg] = useState('')
 
   const handleConfirm = async () => {
-    setRunning(true)
+    setPhase('running')
+    setStatusMsg('Starting migration…')
     try {
       const res = await fetch(`${API}/api/agent/run/async`, {
         method: 'POST',
@@ -460,21 +534,44 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
           initiated_by: 'HITL Console',
         }),
       })
-      if (!res.ok) {
-        const err = await res.text()
-        throw new Error(`HTTP ${res.status}: ${err}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
+      const { trace_id } = await res.json()
+      setStatusMsg('Agent running — discovering schema, transforming data, running QA critic…')
+
+      // Poll the background job so the user actually sees the outcome instead of a
+      // silently-closing modal. Async run returns 202 immediately; the real result
+      // (or failure reason) only lands when the job finishes.
+      const startedAt = Date.now()
+      while (Date.now() - startedAt < 300000) {
+        await new Promise((r) => setTimeout(r, 2500))
+        const jr = await fetch(`${API}/api/agent/jobs/${trace_id}`)
+        if (!jr.ok) continue
+        const job = await jr.json()
+        if (job.status === 'succeeded') {
+          setResult(job.result || {})
+          setPhase('done')
+          onSuccess()
+          return
+        }
+        if (job.status === 'failed') {
+          setErrorMsg(job.error || 'Migration failed (no error detail returned).')
+          setPhase('error')
+          return
+        }
       }
-      onSuccess()
-      onClose()
+      setErrorMsg('Timed out after 5 minutes waiting for the migration to finish.')
+      setPhase('error')
     } catch (e) {
-      alert(`Error: ${e instanceof Error ? e.message : 'Failed to start migration'}`)
-    } finally {
-      setRunning(false)
+      setErrorMsg(e instanceof Error ? e.message : 'Failed to start migration')
+      setPhase('error')
     }
   }
 
-  if (showConfirm) {
-    return <MigrationConfirmModal source={source} target={target} running={running} onConfirm={handleConfirm} onCancel={() => setShowConfirm(false)} />
+  if (phase === 'running' || phase === 'done' || phase === 'error') {
+    return <RunStatusModal phase={phase} statusMsg={statusMsg} result={result} errorMsg={errorMsg} onClose={onClose} />
+  }
+  if (phase === 'confirm') {
+    return <MigrationConfirmModal source={source} target={target} running={false} onConfirm={handleConfirm} onCancel={() => setPhase('config')} />
   }
 
   return (
@@ -490,8 +587,7 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
               onChange={(e) => setSource(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
-              <option>ABASE (us-west-2)</option>
-              <option>Custom...</option>
+              <option value="ABASE">ABASE (us-west-2)</option>
             </select>
             <p className="text-xs text-gray-500 mt-1">Read-only source system</p>
           </div>
@@ -503,8 +599,7 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
               onChange={(e) => setTarget(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             >
-              <option>GDS (us-east-2)</option>
-              <option>Custom...</option>
+              <option value="GDS">GDS (us-east-2)</option>
             </select>
             <p className="text-xs text-gray-500 mt-1">Target system for migration</p>
           </div>
@@ -528,13 +623,78 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
               Cancel
             </button>
             <button
-              onClick={() => setShowConfirm(true)}
+              onClick={() => setPhase('confirm')}
               className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
             >
               Next: Authorize
             </button>
           </div>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── RUN STATUS MODAL (live job progress) ──
+function RunStatusModal({
+  phase, statusMsg, result, errorMsg, onClose,
+}: {
+  phase: 'running' | 'done' | 'error'
+  statusMsg: string
+  result: any
+  errorMsg: string
+  onClose: () => void
+}) {
+  const auto = result?.auto_approved ?? result?.auto_promoted ?? 0
+  const review = result?.pending_review ?? 0
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg w-full max-w-md overflow-hidden">
+        {phase === 'running' && (
+          <>
+            <div className="bg-blue-600 text-white px-6 py-4 flex items-center gap-3">
+              <Loader2 size={20} className="animate-spin" />
+              <h2 className="text-lg font-bold">Migration Running</h2>
+            </div>
+            <div className="p-6 space-y-3">
+              <p className="text-sm text-gray-700">{statusMsg}</p>
+              <p className="text-xs text-gray-500">This usually takes 1–2 minutes. Keep this open — the dashboard refreshes automatically when it finishes.</p>
+            </div>
+          </>
+        )}
+        {phase === 'done' && (
+          <>
+            <div className="bg-green-600 text-white px-6 py-4 flex items-center gap-3">
+              <CheckCircle2 size={20} />
+              <h2 className="text-lg font-bold">Migration Complete</h2>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-600">Auto-promoted to production</span>
+                <span className="font-mono font-bold text-green-700">{auto}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-600">Held for human review</span>
+                <span className="font-mono font-bold text-amber-600">{review}</span>
+              </div>
+              <button onClick={onClose} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition">Done</button>
+            </div>
+          </>
+        )}
+        {phase === 'error' && (
+          <>
+            <div className="bg-red-600 text-white px-6 py-4 flex items-center gap-3">
+              <XCircle size={20} />
+              <h2 className="text-lg font-bold">Migration Failed</h2>
+            </div>
+            <div className="p-6 space-y-4">
+              <div className="bg-red-50 border-l-4 border-red-600 p-4">
+                <p className="text-sm text-red-900 break-words">{errorMsg}</p>
+              </div>
+              <button onClick={onClose} className="w-full px-4 py-2 border border-gray-300 rounded-lg font-medium text-gray-700 hover:bg-gray-50 transition">Close</button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )

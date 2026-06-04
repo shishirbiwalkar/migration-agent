@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.connectors import get_abase_pool, get_gds_pool
 from app.agents.review_agent import (
     run_review_agent,
+    run_batch_review_agent,
     load_promotion_config,
     _tool_get_scientist_wells,
 )
@@ -100,4 +101,22 @@ async def run_reviewer(trace_id: str, scientist_name: str, body: RunRequest):
         log.warning("ABASE cleanup skipped: %s", e)
 
     result["abase_deleted"] = abase_deleted
+    return JSONResponse(content=result)
+
+
+# ── POST /api/reviewer/{trace_id}/run  (batch — all scientists at once) ───────
+
+@router.post("/{trace_id}/run")
+async def run_batch_reviewer(trace_id: str, body: RunRequest):
+    """
+    One agent, one instruction, acts across ALL flagged scientists at once.
+    e.g. "Remove Chen_L's wells" or "Singh_A and Gupta_P don't want their data"
+    """
+    log = logging.LoggerAdapter(logger, {"trace_id": trace_id})
+    log.info("Batch review agent started: message=%s", body.message[:80])
+    result = await run_batch_review_agent(
+        trace_id=trace_id,
+        message=body.message,
+        approved_by=body.approved_by,
+    )
     return JSONResponse(content=result)

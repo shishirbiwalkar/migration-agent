@@ -42,7 +42,7 @@ def _is_transient(err: Exception) -> bool:
 
 
 async def generate_with_backoff(client, *, contents, config,
-                                model: str = MODEL, max_attempts: int = 4):
+                                model: str = MODEL, max_attempts: int = 4, timeout_sec: float = 60):
     """
     Call Gemini with model failover + backoff.
 
@@ -62,11 +62,19 @@ async def generate_with_backoff(client, *, contents, config,
         for idx, m in enumerate(chain):
             is_primary = idx == 0
             try:
-                resp = await client.aio.models.generate_content(
-                    model=m, contents=contents, config=config)
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=m, contents=contents, config=config),
+                    timeout=timeout_sec
+                )
                 if m != model:
                     logger.info("LLM served by fallback model %s (requested %s)", m, model)
                 return resp
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                logger.warning("LLM timeout on %s (attempt %d) — trying next model",
+                               m, attempt + 1)
+                continue
             except Exception as e:
                 last_exc = e
                 transient = _is_transient(e)

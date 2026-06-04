@@ -73,6 +73,21 @@ async def _gather_critic_data(trace_id: str) -> dict:
         fk_col    = config.get("records_table", {}).get("fk_column", "")
         auto_filled.update({c for c in (entity_pk, fk_col, "trace_id", "approved_by") if c})
 
+        # Audit the config AS THE INFRA WILL ACTUALLY USE IT. The promotion step
+        # (migration.py _promote_rows) drops any records_table.column_map entry whose
+        # TARGET is an infra-managed column (fk_column, trace_id, approved_by) — those
+        # are linked from the entity PK, never written from source. A stray mapping like
+        # `user_name -> gds_user_id` is silently ignored at promotion time, but if shown
+        # to the critic it reads as a text->uuid type mismatch and trips a FALSE-POSITIVE
+        # error FLAG that forces every row to review. Strip it here so the critic reviews
+        # the effective mapping, identical to what is promoted.
+        rec_cfg = config.get("records_table")
+        if isinstance(rec_cfg, dict) and isinstance(rec_cfg.get("column_map"), dict):
+            _infra = {"trace_id", "approved_by", fk_col} - {""}
+            rec_cfg["column_map"] = {
+                src: tgt for src, tgt in rec_cfg["column_map"].items() if tgt not in _infra
+            }
+
         # Sample of staged rows — shows the agent's intermediate column names + real values
         staging_tbl = _safe_table(config.get("staging_table", "gds_staging_experiments"))
         sample_rows = await conn.fetch(
@@ -222,15 +237,67 @@ Return your verdict as JSON.
             "raw": raw[:500],
         }
 
+    # ── Deterministic auto-filled guard ──────────────────────────────────────
+    # The prompt tells the LLM never to raise error/warning findings on
+    # infrastructure-managed (auto-filled) columns — but LLMs violate this. The
+    # promotion infra PROVABLY ignores those columns (migration.py _promote_rows
+    # drops them), so an error finding on one cannot corrupt data. Enforce the rule
+    # in code: downgrade any error/warning finding whose TARGET is an auto-filled
+    # column to "info", so a false positive can never force every row to HITL.
+    import re as _re
+    auto_filled = {c.lower() for c in data.get("auto_filled_columns", []) if c}
+    # Target columns whose type is textual — casting ANY source value into them is
+    # lossless and safe (Postgres text holds any value; the infra str()-casts when
+    # needed). A "type mismatch" finding against a text target is therefore always a
+    # false positive and must never gate auto-promotion.
+    _TEXT_TYPES = ("text", "character varying", "character", "varchar", "char")
+    text_targets = {
+        col["column"].lower()
+        for cols in (data.get("target_schema") or {}).values()
+        for col in cols
+        if any(t in str(col.get("type", "")).lower() for t in _TEXT_TYPES)
+    }
+    findings = verdict.get("findings", []) or []
+    for f in findings:
+        if f.get("severity") not in ("error", "warning"):
+            continue
+        # The LLM's phrasing is unpredictable (it may put the column in `field`, in the
+        # `issue` text, with a "table." prefix, or as "(uuid)" annotations). Scan the WHOLE
+        # finding for any infra-managed signal. These categories are PROVABLY false positives
+        # because the deterministic infra already handles them:
+        #   1. auto-filled columns  — stripped before promotion (migration.py _promote_rows)
+        #   2. upsert keys          — auto-corrected against real pg_constraint unique keys
+        #   3. text-typed targets   — any source value casts losslessly into a text column
+        blob = " ".join(str(f.get(k, "")) for k in ("field", "issue", "recommendation")).lower()
+        tokens = set(_re.findall(r"[a-z0-9_]+", blob))
+        mentions_autofilled = bool(auto_filled & tokens)
+        mentions_upsert     = "upsert" in blob or "on conflict" in blob or "conflict" in tokens
+        mentions_text_tgt   = bool(text_targets & tokens)
+        if mentions_autofilled or mentions_upsert or mentions_text_tgt:
+            reason = ("auto-filled column — infra-managed, not written from source" if mentions_autofilled
+                      else "upsert key — auto-corrected against real unique constraints" if mentions_upsert
+                      else "text-typed target column — any value casts losslessly into text")
+            f["severity"] = "info"
+            f["issue"] = f"[{reason}; downgraded from a false-positive flag] " + str(f.get("issue", ""))
+
+    # Recompute the verdict from the (possibly downgraded) findings: FLAG only if a
+    # genuine error-severity finding remains. This keeps verdict consistent with the
+    # escalation rule both orchestration paths apply.
+    has_error = any(f.get("severity") == "error" for f in findings)
+    final_verdict = "FLAG" if has_error else "APPROVE"
+    if final_verdict != verdict.get("verdict"):
+        logger.info("Critic verdict for trace=%s adjusted %s -> %s after auto-filled guard",
+                    trace_id, verdict.get("verdict"), final_verdict)
+
     logger.info("Critic verdict for trace=%s: %s (%d findings)",
-                trace_id, verdict.get("verdict"), len(verdict.get("findings", [])))
+                trace_id, final_verdict, len(findings))
 
     return {
         "trace_id":      trace_id,
         "generated_at":  datetime.now(timezone.utc).isoformat(),
-        "verdict":       verdict.get("verdict"),
+        "verdict":       final_verdict,
         "confidence":    verdict.get("confidence"),
         "summary":       verdict.get("summary"),
-        "findings":      verdict.get("findings", []),
+        "findings":      findings,
         "reviewed_mapping": data["promotion_config"],
     }

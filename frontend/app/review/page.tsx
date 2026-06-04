@@ -5,7 +5,7 @@ import { useSearchParams, useRouter } from 'next/navigation'
 import {
   ClipboardCheck, CheckCircle2, XCircle, Loader2,
   AlertTriangle, X, ArrowLeft, Users, FlaskConical,
-  ChevronDown, ChevronRight, Trash2, RotateCcw,
+  ChevronDown, ChevronRight, Trash2, RotateCcw, Bot, Send,
 } from 'lucide-react'
 
 const API          = 'http://localhost:8001'
@@ -223,11 +223,14 @@ function HITLView() {
   const router       = useRouter()
   const traceId      = searchParams.get('trace_id') ?? ''
 
-  const [data,   setData]   = useState<StagingData | null>(null)
-  const [loading,setLoading] = useState(false)
-  const [error,  setError]  = useState<string | null>(null)
-  const [action, setAction] = useState<ActionState>('idle')
-  const [toast,  setToast]  = useState<Toast | null>(null)
+  const [data,        setData]        = useState<StagingData | null>(null)
+  const [loading,     setLoading]     = useState(false)
+  const [error,       setError]       = useState<string | null>(null)
+  const [action,      setAction]      = useState<ActionState>('idle')
+  const [toast,       setToast]       = useState<Toast | null>(null)
+  const [aiMessage,   setAiMessage]   = useState('')
+  const [aiRunning,   setAiRunning]   = useState(false)
+  const [aiResult,    setAiResult]    = useState<{ result: string; actions_taken: any[] } | null>(null)
 
   const fetchStaging = async (id: string) => {
     setLoading(true); setError(null)
@@ -284,6 +287,28 @@ function HITLView() {
       fetchStaging(traceId)
     } catch (e: unknown) { setToast({ type:'error', message: e instanceof Error ? e.message : 'Failed' }) }
     finally { setAction('idle') }
+  }
+
+  const runBatchAgent = async () => {
+    if (!aiMessage.trim() || aiRunning) return
+    setAiRunning(true)
+    setAiResult(null)
+    try {
+      const res = await fetch(`${API}/api/reviewer/${traceId}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: aiMessage.trim(), approved_by: 'Review Agent' }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setAiResult(data)
+      setAiMessage('')
+      fetchStaging(traceId)
+    } catch (e) {
+      setToast({ type: 'error', message: e instanceof Error ? e.message : 'Agent failed' })
+    } finally {
+      setAiRunning(false)
+    }
   }
 
   if (!traceId) return (
@@ -418,6 +443,46 @@ function HITLView() {
                     </div>
                   </div>
                 )}
+
+                {/* ── AI Batch Agent Panel ── */}
+                <div className="mb-6 bg-white border border-purple-200 rounded-xl overflow-hidden">
+                  <div className="flex items-center gap-2 px-4 py-3 bg-purple-50 border-b border-purple-100">
+                    <Bot size={15} className="text-purple-600" />
+                    <p className="text-sm font-semibold text-purple-900">AI Review Agent</p>
+                    <span className="text-xs text-purple-500 ml-1">— acts on all flagged scientists at once</span>
+                  </div>
+                  <div className="p-4 space-y-3">
+                    <textarea
+                      value={aiMessage}
+                      onChange={e => setAiMessage(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runBatchAgent() } }}
+                      placeholder={`e.g. "Remove Chen_L's wells"  or  "Singh_A and Walsh_D don't want their data migrated"  or  "Approve everyone"`}
+                      rows={2}
+                      disabled={aiRunning}
+                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-purple-400 placeholder-gray-400 disabled:opacity-50"
+                    />
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs text-gray-400">Press Enter to send · Shift+Enter for new line</p>
+                      <button
+                        onClick={runBatchAgent}
+                        disabled={!aiMessage.trim() || aiRunning}
+                        className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-semibold rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {aiRunning ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+                        {aiRunning ? 'Agent thinking…' : 'Send'}
+                      </button>
+                    </div>
+                    {aiResult && (
+                      <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 space-y-2">
+                        <div className="flex items-center gap-2 mb-1">
+                          <CheckCircle2 size={13} className="text-green-500" />
+                          <p className="text-xs font-semibold text-gray-700">Agent completed — {aiResult.actions_taken.length} action(s) taken</p>
+                        </div>
+                        <pre className="text-xs text-gray-600 whitespace-pre-wrap font-sans leading-relaxed">{aiResult.result}</pre>
+                      </div>
+                    )}
+                  </div>
+                </div>
 
                 {/* User cards */}
                 <div className="space-y-3 mb-6">

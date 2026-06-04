@@ -54,7 +54,6 @@ async def get_completed_runs():
                         COUNT(*) FILTER (WHERE status = 'pending')       AS pending
                     FROM {table}
                     GROUP BY trace_id
-                    HAVING COUNT(*) FILTER (WHERE status = 'pending') = 0
                     ORDER BY MIN(created_at) DESC
                 """)
                 rows.extend(table_rows)
@@ -67,12 +66,13 @@ async def get_completed_runs():
     runs = []
     for r in rows:
         runs.append({
-            "trace_id":     str(r["trace_id"]),
-            "run_date":     r["run_date"].isoformat(),
-            "total_rows":   int(r["total_rows"]),
+            "trace_id":      str(r["trace_id"]),
+            "completed_at":  r["run_date"].isoformat(),
+            "total_rows":    int(r["total_rows"]),
             "auto_approved": int(r["auto_approved"]),
             "hitl_approved": int(r["hitl_approved"]),
-            "excluded":     int(r["excluded"]),
+            "excluded":      int(r["excluded"]),
+            "needs_review":  int(r["pending"]),
             "in_production": int(r["auto_approved"]) + int(r["hitl_approved"]),
         })
 
