@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Database, Play, RefreshCw, ChevronDown, ChevronRight,
-  AlertCircle, CheckCircle2, Clock, Zap, Shield, BarChart3,
+  AlertCircle, AlertTriangle, CheckCircle2, Clock, Zap, Shield, BarChart3,
   FileText, LogOut, Search, Menu, X, Loader2, Check, XCircle,
 } from 'lucide-react'
 
@@ -236,10 +236,11 @@ function NavButton({
 
 // ── DASHBOARD VIEW ──
 function DashboardView({ migrations, loading }: { migrations: MigrationRun[]; loading: boolean }) {
-  const activeMigrations = migrations.filter(m => m.status === 'running' || m.status === 'review_pending')
-  const completedMigrations = migrations.filter(m => m.status === 'completed')
-  const totalFlagged = migrations.reduce((sum, m) => sum + m.flagged, 0)
-  const totalApproved = migrations.reduce((sum, m) => sum + m.auto_approved, 0)
+  const safeData = migrations || []
+  const activeMigrations = safeData.filter(m => m.status === 'running' || m.status === 'review_pending')
+  const completedMigrations = safeData.filter(m => m.status === 'completed')
+  const totalFlagged = safeData.reduce((sum, m) => sum + (m.flagged || 0), 0)
+  const totalApproved = safeData.reduce((sum, m) => sum + (m.auto_approved || 0), 0)
 
   return (
     <div className="p-6 space-y-6">
@@ -303,12 +304,13 @@ function StatCard({ icon, label, value, color }: { icon: React.ReactNode; label:
     green: 'bg-green-50 text-green-700 border-green-200',
     emerald: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   }
+  const displayValue = Number.isNaN(value) ? 0 : value
   return (
     <div className={`${colors[color as keyof typeof colors]} border rounded-lg p-4`}>
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm font-medium opacity-75">{label}</p>
-          <p className="text-3xl font-bold mt-1">{value}</p>
+          <p className="text-3xl font-bold mt-1">{displayValue}</p>
         </div>
         <div className="opacity-20">{icon}</div>
       </div>
@@ -373,7 +375,8 @@ function MigrationCard({ migration }: { migration: MigrationRun }) {
 
 // ── MIGRATIONS VIEW ──
 function MigrationsView({ migrations }: { migrations: MigrationRun[] }) {
-  const active = migrations.filter(m => m.status === 'running' || m.status === 'review_pending')
+  const safeData = migrations || []
+  const active = safeData.filter(m => m.status === 'running' || m.status === 'review_pending')
   return (
     <div className="p-6">
       {active.length > 0 ? (
@@ -394,7 +397,8 @@ function MigrationsView({ migrations }: { migrations: MigrationRun[] }) {
 
 // ── REVIEWS VIEW ──
 function ReviewsView({ migrations }: { migrations: MigrationRun[] }) {
-  const flaggedCount = migrations.reduce((sum, m) => sum + m.flagged, 0)
+  const safeData = migrations || []
+  const flaggedCount = safeData.reduce((sum, m) => sum + (m.flagged || 0), 0)
   return (
     <div className="p-6">
       {flaggedCount > 0 ? (
