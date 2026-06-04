@@ -359,13 +359,15 @@ MAPPING SCRIPT RULES (write_and_test_mapping):
 - Output must be a DataFrame assigned to `result`
 - Column names in `result` are YOUR intermediate names — choose them to be clear
 - Join source tables as needed using FK relationships you discovered
-- ALWAYS include the source primary key of the records table as `source_experiment_id` in your result.
-  This enables end-to-end traceability from GDS back to the original source record.
-  Example: if source experiments table has column `id`, include it as result['source_experiment_id'] = experiments['id']
+- INFRASTRUCTURE METADATA (separate from data columns):
+  * source_experiment_id: ALWAYS include the source primary key for traceability
+    Example: result['source_experiment_id'] = experiments['id']
+    This goes in column_map, but MUST NOT be in upsert_keys (it's infrastructure, not a constraint column)
+  * risk_level: 'review' for anomalous rows, 'auto' for clean rows (infrastructure, not mapped)
+  * trace_id, approved_by: added by infrastructure, never include in your result
 - CRITICAL: Select ONLY the columns you will map to target production tables.
   Do not include nullable source columns you don't need — the infrastructure drops
   rows that have any null value, causing silent data loss.
-- Add risk_level column: 'review' for anomalous rows, 'auto' for clean rows
 
 ANOMALY DETECTION (statistical — not hardcoded):
 - Identify the primary numeric measurement column from your schema analysis
@@ -383,7 +385,8 @@ CRITICAL rules:
 - column_map keys must be the EXACT column names you used in `result` (source/staging side).
 - column_map values must be the EXACT column names in the TARGET table (not staging names).
 - upsert_key must be the TARGET TABLE column name used in the UNIQUE constraint (e.g. "name", NOT your staging column like "user_name").
-- upsert_keys must be TARGET TABLE column names that form the UNIQUE constraint (e.g. ["gds_user_id", "well_position"]). Do NOT include staging/source column names here.
+- upsert_keys must be ONLY TARGET TABLE column names that form the actual UNIQUE constraint in the target table (e.g. ["gds_user_id", "well_position"]). Do NOT include infrastructure columns like source_experiment_id, trace_id, or approved_by.
+- You MAY include source_experiment_id in column_map (for traceability), but MUST NOT include it in upsert_keys — it's infrastructure metadata, not a constraint column.
 - Do NOT include "trace_id" or "approved_by" in any column_map — those are added by infrastructure.
 - The infrastructure reads JSONB staging data by column_map keys — a mismatch causes failure.
 
@@ -397,14 +400,25 @@ CRITICAL rules:
   },
   "records_table": {
     "name": "<target records table name>",
-    "column_map": {"<your_result_col>": "<target_table_col>", ...},
+    "column_map": {
+      "signal": "signal",
+      "user_id": "gds_user_id",
+      "well_position": "well_position",
+      "source_experiment_id": "source_experiment_id"
+    },
     "fk_column": "<FK column name in target records table>",
-    "upsert_keys": ["<TARGET col1>", "<TARGET col2>"]
+    "upsert_keys": ["gds_user_id", "well_position"]
   },
   "anomaly_thresholds": {
     "<your_result_col>": {"low": <float>, "high": <float>, "method": "mean_2sigma"}
   }
 }
+
+NOTE: In the example above:
+- upsert_keys is ["gds_user_id", "well_position"] — ONLY the columns in the actual UNIQUE constraint
+- column_map INCLUDES source_experiment_id for traceability, but it's NOT in upsert_keys
+- This works because the target table has a UNIQUE(gds_user_id, well_position) constraint
+- Do NOT include infrastructure columns (source_experiment_id, trace_id, approved_by) in upsert_keys
 
 After store_promotion_config succeeds, provide a final summary and stop.
 Do not attempt to write to any database — the infrastructure handles that."""

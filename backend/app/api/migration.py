@@ -41,18 +41,20 @@ async def _resolve_conflict_target(conn, table: str, proposed: list[str],
     """
     rows = await conn.fetch("""
         SELECT CASE c.contype WHEN 'p' THEN 'PRIMARY KEY' ELSE 'UNIQUE' END AS ctype,
-               array_agg(a.attname) AS cols
+               array_agg(a.attname ORDER BY a.attnum) AS cols
         FROM   pg_constraint  c
         JOIN   pg_class       t ON t.oid = c.conrelid
         JOIN   pg_namespace   n ON n.oid = t.relnamespace
-        JOIN   pg_attribute   a ON a.attrelid = c.conrelid
+        LEFT JOIN pg_attribute   a ON a.attrelid = c.conrelid
                                 AND a.attnum = ANY(c.conkey)
         WHERE  t.relname = $1
           AND  n.nspname = 'public'
           AND  c.contype IN ('p', 'u')
         GROUP  BY c.oid, c.contype
     """, table)
-    constraints = [(r["ctype"], list(r["cols"])) for r in rows]
+    constraints = [(r["ctype"], list(c for c in r["cols"] if c is not None)) for r in rows]
+    logger.info("ON CONFLICT resolution: table=%s, proposed=%s, available=%s, constraints=%s",
+                table, proposed, available_cols, constraints)
 
     # 1. Proposed keys exactly match a real constraint → use them as-is.
     for _ctype, cols in constraints:
