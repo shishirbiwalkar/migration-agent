@@ -1,446 +1,528 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
-import { useRouter } from 'next/navigation'
 import {
-  FlaskConical, Loader2, AlertTriangle, ChevronRight,
-  ClipboardCheck, Bot, RefreshCw, CheckCircle2, FileText,
-  Play, Database, ShieldCheck, GitMerge, Cpu, CheckCheck, XCircle,
+  Database, Play, RefreshCw, ChevronDown, ChevronRight,
+  AlertCircle, CheckCircle2, Clock, Zap, Shield, BarChart3,
+  FileText, LogOut, Search, Menu, X, Loader2, Check, XCircle,
 } from 'lucide-react'
 
 const API = 'http://localhost:8001'
 
+type NavItem = 'dashboard' | 'migrations' | 'reviews' | 'reports' | 'audit'
+type MigrationStatus = 'running' | 'review_pending' | 'approved' | 'completed'
+
+interface MigrationRun {
+  trace_id: string
+  source: string
+  target: string
+  status: MigrationStatus
+  started_at: string
+  total_rows: number
+  auto_approved: number
+  flagged: number
+  pending: number
+  scientists?: Scientist[]
+}
+
 interface Scientist {
-  name:          string
+  name: string
   pending_wells: number
 }
 
-interface Run {
-  trace_id:      string
-  created_at:    string
-  scientists:    Scientist[]
-  total_pending: number
+interface PendingRow {
+  trace_id: string
+  scientist_name: string
+  well_position: string
+  signal: number
+  risk_level: string
+  status: string
 }
 
-interface CompletedRun {
-  trace_id:       string
-  run_date:       string
-  total_rows:     number
-  auto_approved:  number
-  hitl_approved:  number
-  excluded:       number
-  in_production:  number
-}
+export default function HITLConsole() {
+  const [nav, setNav] = useState<NavItem>('dashboard')
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [migrations, setMigrations] = useState<MigrationRun[]>([])
+  const [pendingRows, setPendingRows] = useState<PendingRow[]>([])
+  const [loading, setLoading] = useState(true)
+  const [showRunModal, setShowRunModal] = useState(false)
+  const [search, setSearch] = useState('')
 
-type StepStatus = 'pending' | 'running' | 'done' | 'failed'
+  // Fetch migrations on mount
+  useEffect(() => {
+    fetchMigrations()
+    const interval = setInterval(fetchMigrations, 5000)
+    return () => clearInterval(interval)
+  }, [])
 
-interface MigrationStep {
-  id:      string
-  label:   string
-  detail:  string
-  icon:    React.ReactNode
-  status:  StepStatus
-}
-
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
-}
-
-function StepRow({ step }: { step: MigrationStep }) {
-  return (
-    <div className={`flex items-start gap-3 py-3 px-4 rounded-lg transition-all ${
-      step.status === 'running' ? 'bg-blue-50 border border-blue-100' :
-      step.status === 'done'    ? 'bg-emerald-50 border border-emerald-100' :
-      step.status === 'failed'  ? 'bg-red-50 border border-red-100' :
-      'bg-gray-50 border border-gray-100 opacity-50'
-    }`}>
-      <div className="mt-0.5 shrink-0">
-        {step.status === 'running' && <Loader2 size={16} className="animate-spin text-blue-500" />}
-        {step.status === 'done'    && <CheckCircle2 size={16} className="text-emerald-500" />}
-        {step.status === 'failed'  && <XCircle size={16} className="text-red-500" />}
-        {step.status === 'pending' && <div className="w-4 h-4 rounded-full border-2 border-gray-300" />}
-      </div>
-      <div className="flex-1 min-w-0">
-        <p className={`text-sm font-semibold ${
-          step.status === 'running' ? 'text-blue-700' :
-          step.status === 'done'    ? 'text-emerald-700' :
-          step.status === 'failed'  ? 'text-red-700' : 'text-gray-400'
-        }`}>{step.label}</p>
-        {(step.status === 'running' || step.status === 'done') && (
-          <p className="text-xs text-gray-500 mt-0.5">{step.detail}</p>
-        )}
-      </div>
-    </div>
-  )
-}
-
-export default function Dashboard() {
-  const router = useRouter()
-  const [runs,          setRuns]          = useState<Run[]>([])
-  const [completedRuns, setCompletedRuns] = useState<CompletedRun[]>([])
-  const [loading,       setLoading]       = useState(true)
-  const [error,         setError]         = useState<string | null>(null)
-
-  // Migration modal state
-  const [showModal,     setShowModal]     = useState(false)
-  const [migrating,     setMigrating]     = useState(false)
-  const [migrateResult, setMigrateResult] = useState<Record<string, unknown> | null>(null)
-  const [migrateError,  setMigrateError]  = useState<string | null>(null)
-  const [steps,         setSteps]         = useState<MigrationStep[]>([])
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-
-  const INITIAL_STEPS: MigrationStep[] = [
-    { id: 'backup',   label: 'Triggering source database backup',  detail: 'Calling cloud infrastructure snapshot API…',    icon: <Database size={14} />,   status: 'pending' },
-    { id: 'verify',   label: 'Verifying backup complete',          detail: 'Polling backup provider for confirmation…',     icon: <ShieldCheck size={14} />, status: 'pending' },
-    { id: 'agent',    label: 'Running migration agent',            detail: 'Schema discovery → semantic mapping → transform…', icon: <Cpu size={14} />,     status: 'pending' },
-    { id: 'staging',  label: 'Writing to staging area',            detail: 'Persisting records to staging buffer…',          icon: <GitMerge size={14} />,    status: 'pending' },
-    { id: 'critic',   label: 'QA critic reviewing mapping',        detail: 'Independent validation of column mappings…',     icon: <ClipboardCheck size={14} />, status: 'pending' },
-    { id: 'promote',  label: 'Auto-approving clean rows',          detail: 'Promoting safe records to production…',          icon: <CheckCheck size={14} />,  status: 'pending' },
-  ]
-
-  const setStep = (id: string, status: StepStatus) =>
-    setSteps(prev => prev.map(s => s.id === id ? { ...s, status } : s))
-
-  const runMigration = async () => {
-    setShowModal(true)
-    setMigrating(true)
-    setMigrateResult(null)
-    setMigrateError(null)
-    setSteps(INITIAL_STEPS)
-
-    // Step 1 — backup
-    setStep('backup', 'running')
-    await new Promise(r => setTimeout(r, 800))
-    setStep('backup', 'done')
-
-    // Step 2 — verify backup
-    setStep('verify', 'running')
-    await new Promise(r => setTimeout(r, 600))
-    setStep('verify', 'done')
-
-    // Step 3 — agent (this is where the real work happens)
-    setStep('agent', 'running')
-
-    try {
-      // Fire async job
-      const startRes = await fetch(`${API}/api/agent/run/async`, { method: 'POST' })
-      if (!startRes.ok) throw new Error(`Failed to start migration: HTTP ${startRes.status}`)
-      const { trace_id, status_url } = await startRes.json()
-
-      // Poll until done
-      await new Promise<void>((resolve, reject) => {
-        let stagingShown  = false
-        let criticShown   = false
-        let promoteShown  = false
-
-        pollRef.current = setInterval(async () => {
-          try {
-            const jobRes = await fetch(`${API}${status_url}`)
-            const job    = await jobRes.json()
-
-            // Show later steps progressively while running
-            if (job.status === 'running' || job.status === 'succeeded') {
-              if (!stagingShown)  { stagingShown  = true; setStep('staging', 'running') }
-            }
-            if (job.status === 'running') {
-              const elapsed = Date.now() - startTime
-              if (elapsed > 8000  && !criticShown)  { criticShown  = true; setStep('staging', 'done'); setStep('critic',  'running') }
-              if (elapsed > 14000 && !promoteShown) { promoteShown = true; setStep('critic',  'done'); setStep('promote', 'running') }
-            }
-
-            if (job.status === 'succeeded') {
-              clearInterval(pollRef.current!)
-              setStep('agent',   'done')
-              setStep('staging', 'done')
-              setStep('critic',  'done')
-              setStep('promote', 'done')
-              setMigrateResult(job.result)
-              resolve()
-            } else if (job.status === 'failed') {
-              clearInterval(pollRef.current!)
-              reject(new Error(job.error || 'Migration failed'))
-            }
-          } catch (e) {
-            clearInterval(pollRef.current!)
-            reject(e)
-          }
-        }, 2000)
-
-        const startTime = Date.now()
-      })
-
-    } catch (e: unknown) {
-      setStep('agent', 'failed')
-      setMigrateError(e instanceof Error ? e.message : 'Migration failed')
-    } finally {
-      setMigrating(false)
-      fetchPending()
-    }
-  }
-
-  const fetchPending = async () => {
-    setLoading(true); setError(null)
+  const fetchMigrations = async () => {
     try {
       const [pendingRes, completedRes] = await Promise.all([
         fetch(`${API}/api/migrate/pending`),
         fetch(`${API}/api/report/completed`),
       ])
-      if (!pendingRes.ok) throw new Error(`HTTP ${pendingRes.status}`)
-      const pendingData   = await pendingRes.json()
-      const completedData = completedRes.ok ? await completedRes.json() : { runs: [] }
-      setRuns(pendingData.runs)
-      setCompletedRuns(completedData.runs)
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to load')
+      const pending = await pendingRes.json()
+      setMigrations(pending.runs || [])
+    } catch (e) {
+      console.error('Error fetching migrations:', e)
     } finally {
       setLoading(false)
     }
   }
 
-  useEffect(() => { fetchPending() }, [])
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
-
   return (
-    <div className="flex h-screen bg-gray-50 overflow-hidden"
-      style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
+    <div className="flex h-screen bg-gray-50">
+      {/* ── SIDEBAR ── */}
+      <div className={`${sidebarOpen ? 'w-64' : 'w-20'} bg-slate-900 text-white transition-all duration-300 flex flex-col border-r border-slate-800`}>
 
-      {/* Sidebar */}
-      <aside className="w-56 bg-white border-r border-gray-200 flex flex-col flex-shrink-0">
-        <div className="px-4 py-5 border-b border-gray-100">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 bg-blue-700 rounded-lg flex items-center justify-center">
-              <FlaskConical size={14} className="text-white" strokeWidth={2.5} />
+        {/* Header */}
+        <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+          {sidebarOpen && <h1 className="text-lg font-bold">HITL</h1>}
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-1 hover:bg-slate-800 rounded">
+            {sidebarOpen ? <X size={20} /> : <Menu size={20} />}
+          </button>
+        </div>
+
+        {/* Search */}
+        {sidebarOpen && (
+          <div className="p-3 border-b border-slate-800">
+            <div className="relative">
+              <Search size={16} className="absolute left-2 top-2 text-gray-400" />
+              <input
+                placeholder="Search migrations..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full pl-8 pr-3 py-2 bg-slate-800 text-sm rounded text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
             </div>
-            <div>
-              <p className="text-sm font-bold text-gray-900 leading-none">Migration Agent</p>
-              <p className="text-[10px] text-gray-400 mt-0.5">GDS Console</p>
-            </div>
+          </div>
+        )}
+
+        {/* Navigation */}
+        <nav className="flex-1 p-3 space-y-2">
+          <NavButton
+            icon={<BarChart3 size={20} />}
+            label="Dashboard"
+            active={nav === 'dashboard'}
+            onClick={() => setNav('dashboard')}
+            sidebarOpen={sidebarOpen}
+          />
+          <NavButton
+            icon={<Zap size={20} />}
+            label="Active Migrations"
+            active={nav === 'migrations'}
+            onClick={() => setNav('migrations')}
+            sidebarOpen={sidebarOpen}
+            badge={migrations.filter(m => m.status === 'running' || m.status === 'review_pending').length}
+          />
+          <NavButton
+            icon={<AlertCircle size={20} />}
+            label="Pending Reviews"
+            active={nav === 'reviews'}
+            onClick={() => setNav('reviews')}
+            sidebarOpen={sidebarOpen}
+            badge={migrations.reduce((sum, m) => sum + m.flagged, 0)}
+          />
+          <NavButton
+            icon={<FileText size={20} />}
+            label="Reports"
+            active={nav === 'reports'}
+            onClick={() => setNav('reports')}
+            sidebarOpen={sidebarOpen}
+          />
+          <NavButton
+            icon={<LogOut size={20} />}
+            label="Audit Log"
+            active={nav === 'audit'}
+            onClick={() => setNav('audit')}
+            sidebarOpen={sidebarOpen}
+          />
+        </nav>
+
+        {/* Footer */}
+        <div className="p-3 border-t border-slate-800 text-xs text-gray-400">
+          {sidebarOpen && (
+            <>
+              <div className="font-semibold text-white mb-2">HITL Console</div>
+              <div>Migration Management System</div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* ── MAIN CONTENT ── */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+
+        {/* Top bar */}
+        <div className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6">
+          <h2 className="text-2xl font-bold text-gray-900">
+            {nav === 'dashboard' && 'Migration Dashboard'}
+            {nav === 'migrations' && 'Active Migrations'}
+            {nav === 'reviews' && 'Pending Reviews'}
+            {nav === 'reports' && 'Reports'}
+            {nav === 'audit' && 'Audit Log'}
+          </h2>
+          <div className="flex items-center gap-4">
+            {nav === 'dashboard' && (
+              <button
+                onClick={() => setShowRunModal(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
+              >
+                <Play size={18} />
+                Run Migration
+              </button>
+            )}
+            <button onClick={fetchMigrations} className="p-2 hover:bg-gray-100 rounded-lg transition">
+              <RefreshCw size={20} className="text-gray-600" />
+            </button>
           </div>
         </div>
 
-        <nav className="flex-1 px-3 py-4 space-y-1">
-          <div className="flex items-center gap-2 w-full px-3 py-2.5 rounded-lg text-sm font-medium bg-blue-50 text-blue-700">
-            <ClipboardCheck size={15} /> Dashboard
+        {/* Content */}
+        <div className="flex-1 overflow-auto">
+          {nav === 'dashboard' && <DashboardView migrations={migrations} loading={loading} />}
+          {nav === 'migrations' && <MigrationsView migrations={migrations} />}
+          {nav === 'reviews' && <ReviewsView migrations={migrations} />}
+          {nav === 'reports' && <ReportsView />}
+          {nav === 'audit' && <AuditView />}
+        </div>
+      </div>
+
+      {/* ── RUN MIGRATION MODAL ── */}
+      {showRunModal && <RunMigrationModal onClose={() => setShowRunModal(false)} onSuccess={fetchMigrations} />}
+    </div>
+  )
+}
+
+// ── Navigation Button ──
+function NavButton({
+  icon,
+  label,
+  active,
+  onClick,
+  sidebarOpen,
+  badge,
+}: {
+  icon: React.ReactNode
+  label: string
+  active: boolean
+  onClick: () => void
+  sidebarOpen: boolean
+  badge?: number
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full flex items-center gap-3 px-3 py-3 rounded-lg font-medium transition ${
+        active
+          ? 'bg-blue-600 text-white'
+          : 'text-gray-300 hover:bg-slate-800'
+      }`}
+    >
+      {icon}
+      {sidebarOpen && (
+        <>
+          <span className="flex-1 text-left">{label}</span>
+          {badge !== undefined && badge > 0 && (
+            <span className="bg-red-600 text-white text-xs rounded-full w-6 h-6 flex items-center justify-center">
+              {badge}
+            </span>
+          )}
+        </>
+      )}
+    </button>
+  )
+}
+
+// ── DASHBOARD VIEW ──
+function DashboardView({ migrations, loading }: { migrations: MigrationRun[]; loading: boolean }) {
+  const activeMigrations = migrations.filter(m => m.status === 'running' || m.status === 'review_pending')
+  const completedMigrations = migrations.filter(m => m.status === 'completed')
+  const totalFlagged = migrations.reduce((sum, m) => sum + m.flagged, 0)
+  const totalApproved = migrations.reduce((sum, m) => sum + m.auto_approved, 0)
+
+  return (
+    <div className="p-6 space-y-6">
+      {/* Quick Stats */}
+      <div className="grid grid-cols-4 gap-4">
+        <StatCard icon={<Zap size={24} />} label="Active" value={activeMigrations.length} color="blue" />
+        <StatCard icon={<AlertCircle size={24} />} label="Pending Review" value={totalFlagged} color="yellow" />
+        <StatCard icon={<Check size={24} />} label="Auto-Approved" value={totalApproved} color="green" />
+        <StatCard icon={<CheckCircle2 size={24} />} label="Completed" value={completedMigrations.length} color="emerald" />
+      </div>
+
+      {/* Active Migrations */}
+      {activeMigrations.length > 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <h3 className="text-lg font-bold text-gray-900 mb-4">Active Migrations</h3>
+          <div className="space-y-4">
+            {activeMigrations.map(m => (
+              <MigrationCard key={m.trace_id} migration={m} />
+            ))}
           </div>
-        </nav>
-      </aside>
+        </div>
+      )}
 
-      {/* Main */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <main className="flex-1 overflow-y-auto">
-          <div className="px-8 py-6 max-w-4xl mx-auto">
-
-            {/* Header */}
-            <div className="flex items-center justify-between mb-6">
-              <div>
-                <h1 className="text-xl font-bold text-gray-900">Pending Resolutions</h1>
-                <p className="text-xs text-gray-400 mt-1">
-                  Scientists waiting for review after reaching back to admin
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <button onClick={fetchPending} disabled={loading}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-500 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50">
-                  <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
-                  Refresh
-                </button>
-                <button onClick={runMigration} disabled={migrating}
-                  className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors disabled:opacity-50 shadow-sm">
-                  <Play size={11} fill="currentColor" />
-                  Run Migration
-                </button>
-              </div>
-            </div>
-
-            {/* Migration Modal */}
-            {showModal && (
-              <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
-
-                  <div className="flex items-center gap-3 mb-5">
-                    <div className="w-9 h-9 bg-blue-700 rounded-xl flex items-center justify-center shrink-0">
-                      <FlaskConical size={16} className="text-white" />
-                    </div>
-                    <div>
-                      <h2 className="text-base font-bold text-gray-900">AI Migration Agent</h2>
-                      <p className="text-xs text-gray-400">Orchestrating pipeline…</p>
-                    </div>
-                    {migrating && <Loader2 size={16} className="animate-spin text-blue-500 ml-auto" />}
-                  </div>
-
-                  <div className="space-y-2 mb-5">
-                    {steps.map(step => <StepRow key={step.id} step={step} />)}
-                  </div>
-
-                  {/* Result */}
-                  {migrateResult && !migrating && (
-                    <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 mb-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <CheckCircle2 size={15} className="text-emerald-600" />
-                        <p className="text-sm font-bold text-emerald-800">Migration Complete</p>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 text-xs">
-                        <div className="bg-white rounded-lg p-2.5 border border-emerald-100">
-                          <p className="text-gray-400">Auto-approved</p>
-                          <p className="text-lg font-bold text-emerald-600">{(migrateResult as Record<string, unknown>).auto_approved as number ?? 0}</p>
-                        </div>
-                        <div className="bg-white rounded-lg p-2.5 border border-emerald-100">
-                          <p className="text-gray-400">Pending review</p>
-                          <p className="text-lg font-bold text-amber-600">{(migrateResult as Record<string, unknown>).pending_review as number ?? 0}</p>
-                        </div>
-                      </div>
-                      {/* Backup info */}
-                      {(migrateResult as Record<string, unknown>).backup && (
-                        <div className="mt-2 flex items-center gap-1.5 text-xs text-gray-500">
-                          <ShieldCheck size={11} className="text-emerald-500" />
-                          Backup: {String(((migrateResult as Record<string, unknown>).backup as Record<string, unknown>)?.provider ?? 'none')} —{' '}
-                          {String(((migrateResult as Record<string, unknown>).backup as Record<string, unknown>)?.status ?? 'skipped')}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Error */}
-                  {migrateError && (
-                    <div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-4 flex gap-2">
-                      <AlertTriangle size={14} className="text-red-500 shrink-0 mt-0.5" />
-                      <p className="text-xs text-red-700">{migrateError}</p>
-                    </div>
-                  )}
-
-                  <button
-                    onClick={() => { setShowModal(false); setMigrateResult(null); setMigrateError(null) }}
-                    disabled={migrating}
-                    className="w-full py-2 text-sm font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors disabled:opacity-40">
-                    {migrating ? 'Running…' : 'Close'}
-                  </button>
+      {/* Recent Completed */}
+      {completedMigrations.length > 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <h3 className="text-lg font-bold text-gray-900 mb-4">Recently Completed</h3>
+          <div className="space-y-3">
+            {completedMigrations.slice(0, 5).map(m => (
+              <div key={m.trace_id} className="flex items-center justify-between p-3 bg-gray-50 rounded">
+                <div>
+                  <p className="font-medium text-gray-900">{m.trace_id.slice(0, 8)}...</p>
+                  <p className="text-sm text-gray-500">{m.started_at}</p>
                 </div>
-              </div>
-            )}
-
-            {/* Loading */}
-            {loading && (
-              <div className="flex items-center justify-center py-20">
-                <Loader2 size={22} className="animate-spin text-blue-500" />
-              </div>
-            )}
-
-            {/* Error */}
-            {error && (
-              <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex gap-3">
-                <AlertTriangle size={16} className="text-red-500 shrink-0 mt-0.5" />
-                <p className="text-sm text-red-700">{error}</p>
-              </div>
-            )}
-
-            {/* Empty state */}
-            {!loading && !error && runs.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-24 text-center">
-                <CheckCircle2 size={36} className="text-emerald-400 mb-3" />
-                <p className="text-gray-700 font-semibold">All clear</p>
-                <p className="text-sm text-gray-400 mt-1">
-                  No pending review wells across any migration run.
-                </p>
-              </div>
-            )}
-
-            {/* Run cards */}
-            {!loading && runs.map(run => (
-              <div key={run.trace_id}
-                className="bg-white border border-gray-200 rounded-xl overflow-hidden mb-4 shadow-sm">
-
-                {/* Run header */}
-                <div className="flex items-center gap-3 px-5 py-3 bg-gray-50 border-b border-gray-100">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-mono text-gray-500 truncate">
-                      {run.trace_id}
-                    </p>
-                    <p className="text-[11px] text-gray-400 mt-0.5">
-                      {formatDate(run.created_at)}
-                    </p>
-                  </div>
-                  <span className="text-xs font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-full">
-                    {run.total_pending} pending
-                  </span>
-                  <button
-                    onClick={() => router.push(`/review?trace_id=${run.trace_id}`)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors">
-                    <ClipboardCheck size={11} /> HITL Review
-                  </button>
-                </div>
-
-                {/* Scientist rows */}
-                <div className="divide-y divide-gray-50">
-                  {run.scientists.map(scientist => (
-                    <div key={scientist.name}
-                      className="flex items-center gap-4 px-5 py-3 hover:bg-gray-50 transition-colors">
-
-                      <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-700 font-bold text-xs shrink-0">
-                        {scientist.name.split('_').map((p: string) => p[0]).join('').slice(0, 2)}
-                      </div>
-
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-semibold text-gray-900">{scientist.name}</p>
-                        <p className="text-xs text-amber-600 font-medium mt-0.5">
-                          {scientist.pending_wells} well{scientist.pending_wells !== 1 ? 's' : ''} pending
-                        </p>
-                      </div>
-
-                      <button
-                        onClick={() => router.push(
-                          `/reviewer?trace_id=${run.trace_id}&scientist=${encodeURIComponent(scientist.name)}`
-                        )}
-                        className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors">
-                        <Bot size={12} /> Open Reviewer
-                        <ChevronRight size={12} />
-                      </button>
-                    </div>
-                  ))}
+                <div className="text-right">
+                  <p className="text-sm font-medium text-gray-900">{m.total_rows} rows</p>
+                  <p className="text-xs text-green-600">✓ Approved</p>
                 </div>
               </div>
             ))}
-
-            {/* Completed runs */}
-            {!loading && completedRuns.length > 0 && (
-              <div className="mt-8">
-                <div className="flex items-center gap-2 mb-3">
-                  <CheckCircle2 size={14} className="text-emerald-500" />
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-gray-500">
-                    Completed Migrations
-                  </h2>
-                </div>
-                <div className="space-y-2">
-                  {completedRuns.map(run => (
-                    <div key={run.trace_id}
-                      className="bg-white border border-gray-200 rounded-xl px-5 py-3 flex items-center gap-4 shadow-sm">
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-mono text-gray-500 truncate">{run.trace_id}</p>
-                        <p className="text-[11px] text-gray-400 mt-0.5">{formatDate(run.run_date)}</p>
-                      </div>
-                      <div className="flex items-center gap-3 text-xs text-gray-500">
-                        <span className="text-emerald-600 font-semibold">{run.in_production} promoted</span>
-                        {run.excluded > 0 && (
-                          <span className="text-red-400">{run.excluded} excluded</span>
-                        )}
-                      </div>
-                      <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-                        <CheckCircle2 size={9} /> Complete
-                      </span>
-                      <button
-                        onClick={() => router.push(`/report?trace_id=${run.trace_id}`)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-gray-700 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 transition-colors">
-                        <FileText size={11} /> View Report
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
           </div>
-        </main>
+        </div>
+      )}
+
+      {activeMigrations.length === 0 && completedMigrations.length === 0 && !loading && (
+        <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
+          <Database size={48} className="mx-auto text-gray-300 mb-4" />
+          <p className="text-gray-600 text-lg">No migrations yet</p>
+          <p className="text-gray-500 text-sm">Click "Run Migration" to start</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── STAT CARD ──
+function StatCard({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: number; color: string }) {
+  const colors = {
+    blue: 'bg-blue-50 text-blue-700 border-blue-200',
+    yellow: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+    green: 'bg-green-50 text-green-700 border-green-200',
+    emerald: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  }
+  return (
+    <div className={`${colors[color as keyof typeof colors]} border rounded-lg p-4`}>
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm font-medium opacity-75">{label}</p>
+          <p className="text-3xl font-bold mt-1">{value}</p>
+        </div>
+        <div className="opacity-20">{icon}</div>
+      </div>
+    </div>
+  )
+}
+
+// ── MIGRATION CARD ──
+function MigrationCard({ migration }: { migration: MigrationRun }) {
+  const statusColor =
+    migration.status === 'running' ? 'bg-blue-50 border-blue-200' :
+    migration.status === 'review_pending' ? 'bg-yellow-50 border-yellow-200' :
+    'bg-green-50 border-green-200'
+
+  const statusIcon =
+    migration.status === 'running' ? <Loader2 size={18} className="animate-spin text-blue-600" /> :
+    migration.status === 'review_pending' ? <AlertCircle size={18} className="text-yellow-600" /> :
+    <CheckCircle2 size={18} className="text-green-600" />
+
+  return (
+    <div className={`${statusColor} border rounded-lg p-4`}>
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex items-center gap-3">
+          {statusIcon}
+          <div>
+            <p className="font-mono text-sm font-medium text-gray-900">{migration.trace_id.slice(0, 8)}...</p>
+            <p className="text-xs text-gray-600">{migration.source} → {migration.target}</p>
+          </div>
+        </div>
+        <span className="px-2 py-1 bg-white rounded text-xs font-medium text-gray-700">
+          {migration.status === 'running' ? '🔄 Running' : migration.status === 'review_pending' ? '⏳ Pending Review' : '✓ Completed'}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-4 gap-2 mb-3">
+        <div className="bg-white rounded p-2 text-center">
+          <p className="text-xs text-gray-600">Total</p>
+          <p className="font-bold text-gray-900">{migration.total_rows}</p>
+        </div>
+        <div className="bg-white rounded p-2 text-center">
+          <p className="text-xs text-gray-600">Auto ✓</p>
+          <p className="font-bold text-green-600">{migration.auto_approved}</p>
+        </div>
+        <div className="bg-white rounded p-2 text-center">
+          <p className="text-xs text-gray-600">Flagged</p>
+          <p className="font-bold text-yellow-600">{migration.flagged}</p>
+        </div>
+        <div className="bg-white rounded p-2 text-center">
+          <p className="text-xs text-gray-600">Pending</p>
+          <p className="font-bold text-blue-600">{migration.pending}</p>
+        </div>
+      </div>
+
+      {migration.status === 'review_pending' && migration.flagged > 0 && (
+        <button className="w-full px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded font-medium text-sm transition">
+          Review {migration.flagged} Flagged Rows
+        </button>
+      )}
+    </div>
+  )
+}
+
+// ── MIGRATIONS VIEW ──
+function MigrationsView({ migrations }: { migrations: MigrationRun[] }) {
+  const active = migrations.filter(m => m.status === 'running' || m.status === 'review_pending')
+  return (
+    <div className="p-6">
+      {active.length > 0 ? (
+        <div className="space-y-4">
+          {active.map(m => (
+            <MigrationCard key={m.trace_id} migration={m} />
+          ))}
+        </div>
+      ) : (
+        <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
+          <Clock size={48} className="mx-auto text-gray-300 mb-4" />
+          <p className="text-gray-600">No active migrations</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── REVIEWS VIEW ──
+function ReviewsView({ migrations }: { migrations: MigrationRun[] }) {
+  const flaggedCount = migrations.reduce((sum, m) => sum + m.flagged, 0)
+  return (
+    <div className="p-6">
+      {flaggedCount > 0 ? (
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <h3 className="text-lg font-bold text-gray-900 mb-4">{flaggedCount} Rows Pending Review</h3>
+          <p className="text-gray-600">Review queue implementation coming soon</p>
+        </div>
+      ) : (
+        <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
+          <CheckCircle2 size={48} className="mx-auto text-green-300 mb-4" />
+          <p className="text-gray-600 text-lg">No pending reviews</p>
+          <p className="text-gray-500">All rows have been approved</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── REPORTS VIEW ──
+function ReportsView() {
+  return (
+    <div className="p-6">
+      <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
+        <FileText size={48} className="mx-auto text-gray-300 mb-4" />
+        <p className="text-gray-600">Reports view coming soon</p>
+      </div>
+    </div>
+  )
+}
+
+// ── AUDIT LOG VIEW ──
+function AuditView() {
+  return (
+    <div className="p-6">
+      <div className="bg-white rounded-lg border border-gray-200 p-12 text-center">
+        <LogOut size={48} className="mx-auto text-gray-300 mb-4" />
+        <p className="text-gray-600">Audit log view coming soon</p>
+      </div>
+    </div>
+  )
+}
+
+// ── RUN MIGRATION MODAL ──
+function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [source, setSource] = useState('ABASE')
+  const [target, setTarget] = useState('GDS')
+  const [running, setRunning] = useState(false)
+
+  const handleRun = async () => {
+    setRunning(true)
+    try {
+      const res = await fetch(`${API}/api/agent/run/async`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_db_url: source === 'ABASE' ? undefined : source,
+          target_db_url: target === 'GDS' ? undefined : target,
+          initiated_by: 'HITL Console User',
+        }),
+      })
+      if (!res.ok) throw new Error('Failed to start migration')
+      onSuccess()
+      onClose()
+    } catch (e) {
+      console.error('Error:', e)
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg p-8 max-w-md w-full">
+        <h2 className="text-2xl font-bold text-gray-900 mb-6">Run New Migration</h2>
+
+        <div className="space-y-6">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Source Database</label>
+            <select
+              value={source}
+              onChange={(e) => setSource(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              <option>ABASE (us-west-2)</option>
+              <option>Custom...</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Target Database</label>
+            <select
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            >
+              <option>GDS (us-east-2)</option>
+              <option>Custom...</option>
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <label className="flex items-center">
+              <input type="checkbox" defaultChecked className="mr-2" />
+              <span className="text-sm text-gray-700">Auto-approve clean rows</span>
+            </label>
+            <label className="flex items-center">
+              <input type="checkbox" defaultChecked className="mr-2" />
+              <span className="text-sm text-gray-700">Create source backup</span>
+            </label>
+          </div>
+
+          <div className="flex gap-3 pt-4">
+            <button
+              onClick={onClose}
+              className="flex-1 px-4 py-2 border border-gray-300 rounded-lg font-medium text-gray-700 hover:bg-gray-50 transition"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleRun}
+              disabled={running}
+              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-lg font-medium transition flex items-center justify-center gap-2"
+            >
+              {running && <Loader2 size={18} className="animate-spin" />}
+              {running ? 'Running...' : 'Run Migration'}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   )
