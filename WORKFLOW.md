@@ -35,9 +35,12 @@ Optional body: `source_db_url`, `target_db_url`, `initiated_by`. Defaults to ABA
 1. **Run the Migration Agent (read-only).** It:
    - discovers the source and target schemas via `information_schema`
    - samples real rows to understand each column's meaning
-   - writes a pandas transform mapping source → target, **self-repairing** on error
-   - screens each record statistically (mean ± 2σ) into `auto` vs `review`
-   - emits `cleaned_records` + a `promotion_config` JSON mapping
+   - writes a pandas+scipy transform (self-repairing on error) that:
+     - groups wells by (scientist, compound) into one dose-response series
+     - normalizes raw RFU → % inhibition using per-plate neg/pos control wells
+     - fits the Hill equation (scipy `curve_fit`) to compute EC50, Hill slope, Emax, R²
+     - classifies each compound: R² ≥ 0.90 → `auto`; R² < 0.90 → `review`
+   - emits `cleaned_records` (one row per compound) + a `promotion_config` JSON mapping
 2. **Write to staging.** Infrastructure writes all records to `gds_staging_experiments` as JSONB
    (`status='pending'`).
 3. **Mark the source `migrating`.** Involved ABASE researchers are set to
@@ -86,7 +89,7 @@ and investigates anything anomalous:
 |---|---|
 | `get_migration_summary` | counts, field mapping, completeness |
 | `check_reconciliation` | staged = live + removed + pending; researcher balance |
-| `recompute_anomaly_threshold` | independent re-check of the migration's classification |
+| `recompute_anomaly_threshold` | independent re-check of the migration's R²-based classification |
 | `compare_staging_vs_production` | migrated values match source exactly |
 | `get_per_scientist_breakdown` | per-researcher accepted / removed / pending |
 | `get_audit_timeline` | who did what, when (incl. manual approvals/rejections) |

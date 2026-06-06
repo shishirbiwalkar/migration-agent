@@ -32,7 +32,7 @@ cd backend && python scripts/reset_demo.py
 | `backend/app/api/` | HTTP endpoints; **all database writes live here**, never in agents |
 | `backend/app/connectors/` | Async PostgreSQL pool creation/management |
 | `backend/app/core/` | `llm.py` (Gemini client + model failover), `mapping.py` (validation, coercion, config) |
-| `backend/scripts/` | Operational scripts (demo reset) |
+| `backend/scripts/` | Operational scripts: `reset_demo.py` (demo reset + re-seed), `apply_gds_ddl.py` (one-off DDL migration for existing deployments) |
 | `*-frontend/` | Three independent Next.js apps |
 
 ## Conventions & invariants (please preserve)

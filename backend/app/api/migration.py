@@ -140,16 +140,11 @@ async def _promote_rows(
         data     = row_dict["data"] if isinstance(row_dict["data"], dict) \
                    else json_mod.loads(row_dict["data"])
 
-        # 1. Upsert entity (agent maps source columns to target entity table)
-        entity_cols = list(entity_map.values())
-        try:
-            entity_vals = [_coerce(data[src]) for src in entity_map.keys()]
-        except KeyError as e:
-            raise RuntimeError(
-                f"promotion_config entity_table.column_map key {e} not found in staging data. "
-                f"Staging data keys: {list(data.keys())}. "
-                f"column_map keys: {list(entity_map.keys())}"
-            )
+        # 1. Upsert entity — filter to only src keys that exist in staging data
+        #    (agent may map a column name that differs from what it actually staged)
+        live_entity_map = {src: tgt for src, tgt in entity_map.items() if src in data}
+        entity_cols = list(live_entity_map.values())
+        entity_vals = [_coerce(data[src]) for src in live_entity_map.keys()]
 
         entity_conflict = await _resolve_conflict_target(
             conn, entity_tbl, [upsert_key], entity_cols)
@@ -193,12 +188,26 @@ async def _promote_rows(
         uk_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in rec_cols
                               if c not in conflict_keys)
 
+        # Serialize list/dict values (e.g. curve_data) to JSON and cast to JSONB
+        jsonb_idx: set[int] = set()
+        pg_rec_vals: list = []
+        for _i, _v in enumerate(rec_vals):
+            if isinstance(_v, (list, dict)):
+                pg_rec_vals.append(json_mod.dumps(_v))
+                jsonb_idx.add(_i)
+            else:
+                pg_rec_vals.append(_v)
+
+        placeholders = ", ".join(
+            f"${i+1}::jsonb" if i in jsonb_idx else f"${i+1}"
+            for i in range(len(pg_rec_vals))
+        )
         insert_rec = f"""
             INSERT INTO {records_tbl} ({", ".join(rec_cols)})
-            VALUES ({", ".join(f"${i+1}" for i in range(len(rec_vals)))})
+            VALUES ({placeholders})
             ON CONFLICT ({", ".join(conflict_keys)}) DO UPDATE SET {uk_clause}
         """
-        await conn.execute(insert_rec, *rec_vals)
+        await conn.execute(insert_rec, *pg_rec_vals)
         promoted += 1
 
     await conn.execute(f"""

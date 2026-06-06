@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Migration Agent** is an AI-driven, read-only data migration system that discovers source/target database schemas at runtime, reasons about column mapping, generates pandas transformation scripts, classifies rows by anomaly detection, and stages cleaned data for human-in-the-loop review.
+**Migration Agent** is an AI-driven, read-only data migration system that discovers source/target database schemas at runtime, reasons about column mapping, generates pandas+scipy transformation scripts, fits Hill dose-response curves, classifies experiments by R² goodness-of-fit, and stages results for human-in-the-loop review.
 
 **Core principle:** Agents are purely computational and never write to any database. All DB writes are handled by deterministic infrastructure code, leaving a full audit trail.
 
@@ -22,9 +22,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`app/agents/migration_agent.py`** — Core migration agent — truly generic, read-only
   - Accepts `source_url` and `target_url` (works with ANY PostgreSQL databases)
   - Discovers schemas via `information_schema` at runtime
-  - Samples real rows, transforms in-memory with pandas + numpy
-  - Classifies rows using statistical anomaly detection (mean ± 2σ)
-  - Returns `cleaned_records` + `promotion_config` JSON (schema mapping)
+  - Samples real rows, transforms in-memory with pandas + numpy + scipy
+  - When concentration columns are detected: groups wells by (scientist, compound), normalizes RFU → % inhibition using plate controls, fits Hill equation (scipy curve_fit) to compute EC50/Hill slope/R²/Emax, classifies each compound R² ≥ 0.90 → `auto`, R² < 0.90 → `review`
+  - Returns `cleaned_records` (one row per compound) + `promotion_config` JSON (schema mapping)
   - Tool self-repair loop: on script error, agent reads traceback and rewrites
   - Per-run state via `_RunState` dataclass (no module-level globals)
 - **`app/agents/critic_agent.py`** — Single-shot LLM review of `promotion_config` before any data moves
@@ -36,12 +36,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - 5 tools: `get_pending_wells`, `approve_well`, `exclude_well`, `approve_all_wells`, `exclude_all_wells`
   - Writes attributed audit events (actor + timestamp)
 - **`app/agents/verification_agent.py`** — Verification Agent (agentic, 8 read-only tools)
-  - Mandatory battery: reconciliation, independent anomaly re-check, staging vs production comparison
+  - Mandatory battery: reconciliation, independent R²-threshold re-check, staging vs production comparison
   - Produces an enterprise-grade report ending in `Overall: PASS` / `NEEDS REVIEW`
   - Falls back to deterministic `report_agent.py` if Gemini is unavailable
 - **`app/agents/orchestrator_agent.py`** — Orchestrator Agent (agentic, opt-in via `ORCHESTRATOR_AGENT=true`)
   - True tool-calling agent (8 tools, up to 25 turns) that reasons about each step instead of running the fixed flow
-  - Enforces the same invariants explicitly: **won't migrate without a confirmed backup**, escalates all rows to HITL on critic error-findings, flags unusual runs (>50% rows flagged)
+  - Enforces the same invariants explicitly: **won't migrate without a confirmed backup**, escalates all rows to HITL on critic error-findings, flags unusual runs (>75% rows flagged — not an escalation, just a warning)
   - Delegates to the same sub-agents + `pipeline_helpers`, so writes are equivalent to the deterministic path
 - **`app/api/agent.py`** — Orchestration entry point
   - `POST /api/agent/run` — synchronous run; `POST /api/agent/run/async` — background run + poll
@@ -59,7 +59,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `auto_approve_clean_rows()` — Auto-promote `risk_level='auto'` rows
   - `approve()` / `reject()` / `rollback()` endpoints with full audit trail
 - **`app/api/abase.py`** — Read ABASE data (list scientists, drill into experiments)
-- **`app/api/gds.py`** — Read GDS data (list promoted scientists, drill into wells)
+- **`app/api/gds.py`** — Read GDS data (list promoted scientists with EC50/R², drill into compound experiments, plate heatmap endpoint)
 - **`app/connectors/`** — Async PostgreSQL pool management; shared `_create_pool(url)` decodes percent-encoded passwords
 
 #### Frontends (Next.js + React)
@@ -72,7 +72,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`schema_gds.sql`** — GDS tables:
   - `gds_users` — scientists by name (UUID primary key)
   - `gds_staging_experiments` — UNLOGGED table, fast transient buffer (data loss on crash intentional)
-  - `gds_experiments` — production wells, UNIQUE(gds_user_id, well_position), immutable once approved
+  - `gds_experiments` — production compound experiments, UNIQUE(gds_user_id, compound_id), immutable once approved; columns: ec50_um, hill_slope, r_squared, curve_quality, num_concentration_points, curve_data (JSONB), plate_barcode, neg_ctrl_mean, pos_ctrl_mean
   - `migration_plans` — stores agent's `promotion_config` JSON per trace_id
   - `migration_audit_log` — append-only audit trail
   - `migration_mappings` — schema-fingerprint → cached transform (skips LLM on repeated runs)
@@ -82,16 +82,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Demo Data (`seed_abase_v2.sql`)
 
-**20 scientists, 80 wells** (4 wells per scientist across 10 plates, 2 scientists per plate).
+**20 scientists, 240 wells** across 3 plates (8 scientists per plate, 12 wells per scientist row).
 
-**10 flagged wells** (signal values 62–75, well above the mean±2σ threshold of ~54):
-- **Chen_L** — 2 flagged wells (B03: 63.00, B04: 62.00) — batch contamination scenario
-- **Singh_A** — 2 flagged wells (B03: 68.40, B04: 66.00) — repeated anomaly scenario
-- Williams_K, Mueller_T, Gupta_P, Lee_H, Brown_E, Walsh_D — 1 flagged well each
+Each scientist occupies one row (A–H) on a plate:
+- **Columns 01–10**: sample wells — 10 log-spaced concentrations for dose-response fitting
+- **Column 11**: negative control (DMSO, ~88,000–92,000 RFU — 0 % inhibition baseline)
+- **Column 12**: positive control (reference inhibitor, ~5,000–8,000 RFU — 100 % inhibition)
 
-**70 normal wells** (signal values 5.32–15.01) auto-promote without human review.
+The Migration Agent groups the 10 sample wells per (scientist, compound) into one dose-response curve, normalizes raw RFU → % inhibition using the plate controls, fits the Hill equation (scipy curve_fit), and classifies each curve by R²:
+- **R² ≥ 0.90** → `risk_level='auto'` (auto-promotes, no human needed)
+- **R² < 0.90** → `risk_level='review'` (held in staging for HITL)
 
-The spike values are deliberately chosen so that even with 10 outliers inflating σ, the 2σ upper bound (~54.6) stays below the lowest outlier (62.0) by a margin of ~7.4 — ensuring reliable flagging regardless of floating-point variance.
+**~10 compounds are seeded with poor-quality curves** (intentionally noisy RFU values so that R² falls below 0.90), giving reviewers something to inspect in every demo run. The remaining ~10 compounds produce clean sigmoid curves (R² ≥ 0.95 — `excellent`) and auto-promote.
 
 ## Commands
 
@@ -100,7 +102,7 @@ The spike values are deliberately chosen so that even with 10 outliers inflating
 cd backend
 python scripts/reset_demo.py
 # Expected output ends with:
-#   ABASE → 20 scientists, 80 wells
+#   ABASE → 20 scientists, 240 wells
 #   GDS   → 0 users, 0 experiments, 0 staging rows
 #   Status: READY FOR DEMO ✓
 ```
@@ -131,14 +133,21 @@ The Migration Agent **never knows about ABASE or GDS by name**. It only knows:
 
 Works for ANY PostgreSQL → PostgreSQL migration. ABASE → GDS is just the default.
 
-### Anomaly Detection
-Thresholds computed dynamically from actual sampled data (not hardcoded):
+### Curve Quality Screening (R²-based)
+When the source has a concentration column, the Migration Agent fits a Hill equation to each (scientist, compound) dose-response series:
 ```
-mean   = avg of signal column
-std    = standard deviation
-flagged = value < mean − 2σ  OR  value > mean + 2σ
+R² ≥ 0.90  →  risk_level = 'auto'    (good fit — auto-promote)
+R² < 0.90  →  risk_level = 'review'  (poor fit — hold for HITL)
+
+curve_quality label:
+  R² ≥ 0.95  →  'excellent'
+  R² ≥ 0.90  →  'good'
+  R² ≥ 0.80  →  'fair'
+  R² < 0.80  →  'poor'
 ```
-The Verification Agent **independently recomputes** these thresholds to audit the Migration Agent's work.
+Individual curve points are also classified: `|residual| > 3σ` → `'critical'` (shown as X on the curve plot).
+
+The Verification Agent **independently recomputes** R² thresholds and compares classifications to audit the Migration Agent's work.
 
 ### Partial HITL
 - **Auto rows** (`risk_level='auto'`): safe → auto-promote to `gds_experiments` immediately
@@ -218,8 +227,8 @@ Key location: `backend/.env` as `GEMINI_API_KEY`. Billing-enabled key strongly r
 - **No hardcoded database identifiers** — table/column names come from `information_schema` at runtime or from the agent's `promotion_config` JSON
 - **`promotion_config` is the glue** — agent outputs it; infrastructure reads it back generically
 - **UNLOGGED staging table is intentional** — fast, no WAL overhead; data loss on crash is acceptable for transient staging
-- **Production wells are immutable** — `UNIQUE(gds_user_id, well_position)` prevents duplicates on re-migration
-- **ABASE cleanup is post-commit** — scientists are hard-deleted from ABASE only after ALL their wells are confirmed live in GDS; partial migrations leave source intact
+- **Production records are immutable** — `UNIQUE(gds_user_id, compound_id)` prevents duplicates on re-migration (each row represents one compound's fitted curve, not a single well)
+- **ABASE cleanup is post-commit** — scientists are hard-deleted from ABASE only after ALL their compound experiments are confirmed live in GDS; partial migrations leave source intact
 - **Source is backed up before any change** — `app/core/backup.py` snapshots the source via `BACKUP_PROVIDER`; non-blocking in the deterministic path, mandatory under the Orchestrator Agent
 - **Two orchestration modes** — `ORCHESTRATOR_AGENT=false` (default) runs the fixed pipeline; `ORCHESTRATOR_AGENT=true` runs the agentic `orchestrator_agent.py`. Both share `pipeline_helpers.py`
 - **Critic escalation is severity-based** — only a `FLAG` with an `error`-severity finding forces all rows to HITL; warnings/info never block auto-promotion

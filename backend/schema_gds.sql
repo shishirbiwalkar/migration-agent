@@ -35,17 +35,38 @@ CREATE TABLE IF NOT EXISTS gds_experiments (
     experiment_id UUID             PRIMARY KEY DEFAULT gen_random_uuid(),
     gds_user_id   UUID             NOT NULL REFERENCES gds_users(gds_user_id),
     trace_id      UUID             NOT NULL,
-    well_position TEXT             NOT NULL,
-    signal        DOUBLE PRECISION NOT NULL,
+    well_position TEXT,                               -- nullable: aggregated rows span multiple wells
+    signal        DOUBLE PRECISION NOT NULL,          -- Emax (top of fitted dose-response curve)
     approved_at          TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     approved_by          TEXT,
-    source_experiment_id TEXT,                        -- ABASE experiment.id for traceability
+    source_experiment_id TEXT,                        -- ABASE experiment.id (first of group) for traceability
     compound_id          TEXT,                        -- screening compound code
-    concentration        DOUBLE PRECISION,            -- test concentration (µM)
+    concentration        DOUBLE PRECISION,            -- not used for aggregated rows
     assay_type           TEXT,                        -- Biochemical / Cell-based / Binding / ...
-    -- one well per scientist globally (idempotent re-migration)
-    CONSTRAINT uq_experiments_user_well UNIQUE (gds_user_id, well_position)
+    -- Dose-response curve parameters (computed by migration agent via scipy Hill fitting)
+    ec50_um                   DOUBLE PRECISION,       -- half-maximal effective concentration (µM)
+    hill_slope                DOUBLE PRECISION,       -- Hill coefficient (steepness of the curve)
+    r_squared                 DOUBLE PRECISION,       -- goodness of fit (0–1; ≥0.90 = acceptable)
+    curve_quality             TEXT,                   -- excellent | good | fair | poor | failed
+    num_concentration_points  INTEGER,                -- number of dilution points used in the fit
+    -- one compound run per scientist globally (idempotent re-migration)
+    CONSTRAINT uq_experiments_user_compound UNIQUE (gds_user_id, compound_id)
 );
+
+-- ============================================================
+-- SUPABASE ALTER TABLE — run these once in the SQL Editor if
+-- the table was created before v3 of this schema:
+--
+--   ALTER TABLE gds_experiments ALTER COLUMN well_position DROP NOT NULL;
+--   ALTER TABLE gds_experiments DROP CONSTRAINT IF EXISTS uq_experiments_user_well;
+--   ALTER TABLE gds_experiments ADD CONSTRAINT uq_experiments_user_compound
+--       UNIQUE (gds_user_id, compound_id);
+--   ALTER TABLE gds_experiments ADD COLUMN IF NOT EXISTS ec50_um DOUBLE PRECISION;
+--   ALTER TABLE gds_experiments ADD COLUMN IF NOT EXISTS hill_slope DOUBLE PRECISION;
+--   ALTER TABLE gds_experiments ADD COLUMN IF NOT EXISTS r_squared DOUBLE PRECISION;
+--   ALTER TABLE gds_experiments ADD COLUMN IF NOT EXISTS curve_quality TEXT;
+--   ALTER TABLE gds_experiments ADD COLUMN IF NOT EXISTS num_concentration_points INTEGER;
+-- ============================================================
 
 CREATE INDEX IF NOT EXISTS idx_experiments_trace_id ON gds_experiments (trace_id);
 CREATE INDEX IF NOT EXISTS idx_experiments_user_id  ON gds_experiments (gds_user_id);

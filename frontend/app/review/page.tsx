@@ -12,13 +12,19 @@ const API          = 'http://localhost:8001'
 const APPROVED_BY  = 'HITL Reviewer'
 
 interface StagingRow {
-  staging_id:     number
-  scientist_name: string
-  scientist_role: string
-  well_position:  string
-  signal:         number
-  status:         'pending' | 'excluded' | 'approved' | 'rejected' | 'auto_approved'
-  risk_level:     'auto' | 'review'
+  staging_id:               number
+  scientist_name:           string
+  scientist_role:           string
+  compound_id:              string | null
+  ec50_um:                  number | null
+  hill_slope:               number | null
+  r_squared:                number | null
+  curve_quality:            string | null
+  signal:                   number | null  // Emax (top of fitted curve)
+  num_concentration_points: number | null
+  assay_type:               string | null
+  status:                   'pending' | 'excluded' | 'approved' | 'rejected' | 'auto_approved'
+  risk_level:               'auto' | 'review'
 }
 
 interface StagingData {
@@ -112,21 +118,20 @@ function UserCard({ name, role, rows, traceId, onRefresh }: {
             <p className={`text-sm font-semibold ${isFullyExcluded ? 'line-through text-gray-400' : 'text-gray-900'}`}>
               {name}
             </p>
-            {/* Anomaly flag — shown when any pending signal is outside valid range */}
-            {pending.some(r => r.signal < 1.0 || r.signal > 20.0) && !isFullyExcluded && (
+            {/* Anomaly flag — shown when any pending curve has poor R² */}
+            {pending.some(r => r.r_squared !== null && r.r_squared !== undefined && r.r_squared < 0.90) && !isFullyExcluded && (
               <span className="flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
-                ⚠ Anomalous signal
+                ⚠ Poor curve fit
               </span>
             )}
           </div>
           <p className="text-xs text-gray-500">
-            {role} · {rows.length} records ·{' '}
-            avg signal: <span className={`font-semibold ${
-              pending.length && (pending.reduce((s,r)=>s+r.signal,0)/pending.length) < 1.0
-                ? 'text-red-600' : 'text-gray-700'
-            }`}>
-              {pending.length ? (pending.reduce((s,r)=>s+r.signal,0)/pending.length).toFixed(2) : '—'}
-            </span>
+            {role} · {rows.length} compound(s) ·{' '}
+            {pending.length > 0 && pending[0].r_squared !== null && pending[0].r_squared !== undefined ? (
+              <>R² <span className={`font-semibold ${pending[0].r_squared < 0.90 ? 'text-red-600' : 'text-green-700'}`}>
+                {pending[0].r_squared.toFixed(3)}
+              </span></>
+            ) : '—'}
           </p>
         </div>
 
@@ -168,19 +173,33 @@ function UserCard({ name, role, rows, traceId, onRefresh }: {
               row.status === 'excluded' ? 'bg-red-50/50 opacity-60' : 'hover:bg-gray-50'
             }`}>
               <div className="w-6" /> {/* indent */}
-              <span className={`font-mono text-sm font-semibold w-12 ${row.status === 'excluded' ? 'line-through text-gray-400' : 'text-gray-900'}`}>
-                {row.well_position}
+              {/* Compound ID */}
+              <span className={`font-mono text-xs font-semibold w-24 truncate ${row.status === 'excluded' ? 'line-through text-gray-400' : 'text-gray-700'}`}>
+                {row.compound_id ?? '—'}
               </span>
-              <span className={`font-mono text-sm flex-1 font-semibold ${
+              {/* EC50 */}
+              <span className={`font-mono text-sm font-semibold w-24 ${row.status === 'excluded' ? 'text-gray-400' : 'text-blue-700'}`}>
+                {row.ec50_um != null ? `${row.ec50_um.toFixed(3)} µM` : '—'}
+              </span>
+              {/* R² with quality badge */}
+              <span className={`text-sm font-semibold w-16 ${
                 row.status === 'excluded' ? 'text-gray-400' :
-                (row.signal != null && (row.signal < 1.0 || row.signal > 20.0)) ? 'text-red-600' : 'text-blue-700'
+                row.r_squared != null && row.r_squared < 0.90 ? 'text-red-600' : 'text-green-700'
               }`}>
-                {row.signal != null ? row.signal.toFixed(3) : '—'}
-                {row.signal != null && (row.signal < 1.0 || row.signal > 20.0) && row.status === 'pending' && (
-                  <span className="ml-1 text-[10px] text-red-500 font-normal">⚠ out of range</span>
-                )}
+                {row.r_squared != null ? row.r_squared.toFixed(3) : '—'}
               </span>
-              <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${
+              {/* Curve quality chip */}
+              {row.curve_quality && row.status !== 'excluded' && (
+                <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
+                  row.curve_quality === 'excellent' ? 'bg-green-50 text-green-700' :
+                  row.curve_quality === 'good'      ? 'bg-blue-50 text-blue-700' :
+                  row.curve_quality === 'fair'      ? 'bg-amber-50 text-amber-700' :
+                  'bg-red-50 text-red-600'
+                }`}>
+                  {row.curve_quality}
+                </span>
+              )}
+              <span className={`ml-auto text-xs px-2 py-0.5 rounded-full font-semibold ${
                 row.status === 'pending'  ? 'bg-amber-50 text-amber-700 ring-1 ring-amber-200' :
                 row.status === 'excluded' ? 'bg-red-50 text-red-500 ring-1 ring-red-200' :
                 'bg-green-50 text-green-700 ring-1 ring-green-200'

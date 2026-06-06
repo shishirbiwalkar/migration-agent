@@ -112,7 +112,15 @@
       "Bash(docker compose *)",
       "Bash(git -C \"/Users/shishirbiwalkar/Migration Agent\" status)",
       "Bash(git checkout *)",
-      "Bash(npm install *)"
+      "Bash(npm install *)",
+      "Bash(pkill -f \"uvicorn.*main\")",
+      "Bash(awk '{print $1, $2, $9}')",
+      "Bash(awk '{print \"PID:\", $2}')",
+      "Bash(git commit *)",
+      "Bash(npm run *)",
+      "Bash(echo \"Frontend PID: $!\")",
+      "Bash(echo \"ABASE Frontend PID: $!\")",
+      "Bash(echo \"GDS Frontend PID: $!\")"
     ]
   }
 }

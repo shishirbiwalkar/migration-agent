@@ -3,7 +3,7 @@ Demo reset script — run this before EVERY demo session.
 
 What it does:
   1. Clears ALL GDS tables (experiments, staging, users, audit, plans)
-  2. Wipes ABASE and re-seeds 20 scientists + 80 wells from seed_abase_v2.sql
+  2. Wipes ABASE and re-seeds 20 scientists + 160 wells from seed_abase_v2.sql
   3. Verifies final counts so you can confirm state is clean before starting
 
 Usage:
@@ -11,7 +11,7 @@ Usage:
   python scripts/reset_demo.py
 
 Expected output:
-  ABASE → 20 scientists, 80 wells  (8 with flagged outlier wells)
+  ABASE → 20 scientists, 160 wells  (8-point dose-response, 10 BAD curves flagged)
   GDS   → 0 users, 0 experiments, 0 staging rows
 """
 import asyncio
@@ -79,9 +79,9 @@ async def reset_abase(conn: asyncpg.Connection) -> None:
     user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
     well_count = await conn.fetchval("SELECT COUNT(*) FROM experiments")
 
-    if user_count != 20 or well_count != 80:
+    if user_count != 20 or well_count != 240:
         raise RuntimeError(
-            f"ABASE seed failed — expected 20 scientists / 80 wells, "
+            f"ABASE seed failed — expected 20 scientists / 240 wells, "
             f"got {user_count} / {well_count}."
         )
     print(f"  ABASE seeded: {user_count} scientists, {well_count} wells. ✓")
@@ -98,7 +98,7 @@ async def verify(gds_conn: asyncpg.Connection, abase_conn: asyncpg.Connection) -
     print(f"  ABASE → {abase_users} scientists, {abase_wells} wells")
     print(f"  GDS   → {gds_users} users, {gds_exps} experiments, {staging} staging rows")
 
-    ok = (abase_users == 20 and abase_wells == 80
+    ok = (abase_users == 20 and abase_wells == 240
           and gds_users == 0 and gds_exps == 0 and staging == 0)
     if ok:
         print("  Status: READY FOR DEMO ✓")

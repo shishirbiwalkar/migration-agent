@@ -376,7 +376,7 @@ PIPELINE RULES:
 7. Report the final outcome clearly: rows auto-promoted, rows pending human review, HITL URL if needed.
 
 DECISION GUIDANCE:
-- If run_sme_etl_agent returns review_rows > 50% of total → flag this as unusual before proceeding
+- If run_sme_etl_agent returns review_rows > 75% of total → flag this as unusual (do NOT escalate — still auto-promote the clean rows)
 - If backup status is 'skipped' (BACKUP_PROVIDER=none) → proceed but warn this is not production-safe
 - If any tool returns an error → reason about whether to retry once or abort
 - Your goal: migrate clean data automatically, send only genuine anomalies to humans

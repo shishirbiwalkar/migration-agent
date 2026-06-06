@@ -514,8 +514,8 @@ function AuditView() {
 
 // ── RUN MIGRATION MODAL (Setup) ──
 function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
-  const [source, setSource] = useState('ABASE')
-  const [target, setTarget] = useState('GDS')
+  const [source, setSource] = useState('')
+  const [target, setTarget] = useState('')
   const [phase, setPhase] = useState<'config' | 'confirm' | 'running' | 'done' | 'error'>('config')
   const [statusMsg, setStatusMsg] = useState('')
   const [result, setResult] = useState<any>(null)
@@ -529,8 +529,8 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          source_db_url: source === 'ABASE' ? undefined : source,
-          target_db_url: target === 'GDS' ? undefined : target,
+          source_db_url: source.trim() || undefined,
+          target_db_url: target.trim() || undefined,
           initiated_by: 'HITL Console',
         }),
       })
@@ -582,26 +582,26 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
         <div className="space-y-6">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">Source Database</label>
-            <select
+            <input
+              type="text"
               value={source}
               onChange={(e) => setSource(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            >
-              <option value="ABASE">ABASE (us-west-2)</option>
-            </select>
-            <p className="text-xs text-gray-500 mt-1">Read-only source system</p>
+              placeholder="postgresql://user:password@host:5432/dbname"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+            />
+            <p className="text-xs text-gray-500 mt-1">Paste any PostgreSQL connection string — read-only source</p>
           </div>
 
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">Target Database</label>
-            <select
+            <input
+              type="text"
               value={target}
               onChange={(e) => setTarget(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            >
-              <option value="GDS">GDS (us-east-2)</option>
-            </select>
-            <p className="text-xs text-gray-500 mt-1">Target system for migration</p>
+              placeholder="postgresql://user:password@host:5432/dbname"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+            />
+            <p className="text-xs text-gray-500 mt-1">Paste any PostgreSQL connection string — migration target</p>
           </div>
 
           <div className="space-y-2">
@@ -624,7 +624,8 @@ function RunMigrationModal({ onClose, onSuccess }: { onClose: () => void; onSucc
             </button>
             <button
               onClick={() => setPhase('confirm')}
-              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
+              disabled={!source.trim() || !target.trim()}
+              className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Next: Authorize
             </button>
@@ -700,6 +701,15 @@ function RunStatusModal({
   )
 }
 
+function maskConnStr(url: string): string {
+  try {
+    const u = new URL(url)
+    return `${u.hostname}/${u.pathname.replace(/^\//, '')}`
+  } catch {
+    return url.length > 40 ? url.slice(0, 40) + '…' : url
+  }
+}
+
 // ── MIGRATION CONFIRM MODAL (requires MIGRATE) ──
 function MigrationConfirmModal({
   source,
@@ -742,11 +752,11 @@ function MigrationConfirmModal({
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span className="text-gray-600">• Source system</span>
-                <span className="font-mono text-gray-900">{source}</span>
+                <span className="font-mono text-gray-900 text-xs">{maskConnStr(source)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">• Target system</span>
-                <span className="font-mono text-gray-900">{target}</span>
+                <span className="font-mono text-gray-900 text-xs">{maskConnStr(target)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-gray-600">• Schema discovery</span>

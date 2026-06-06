@@ -44,6 +44,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import scipy.optimize as _scipy_optimize
 from google.genai import types
 
 from app.core.llm import get_client, generate_with_backoff, MODEL as _MODEL
@@ -228,6 +229,7 @@ def _execute_pandas_transform(source_tables: dict[str, pd.DataFrame], script: st
     namespace = {name: df.copy() for name, df in source_tables.items()}
     namespace["pd"] = pd
     namespace["np"] = np   # for statistical threshold computation
+    namespace["curve_fit"] = _scipy_optimize.curve_fit  # for Hill equation fitting
 
     exec(script, namespace)  # noqa: S102
 
@@ -369,7 +371,90 @@ MAPPING SCRIPT RULES (write_and_test_mapping):
   Do not include nullable source columns you don't need — the infrastructure drops
   rows that have any null value, causing silent data loss.
 
-ANOMALY DETECTION (statistical — not hardcoded):
+DOSE-RESPONSE CURVE FITTING — USE WHEN SOURCE HAS CONCENTRATION COLUMNS:
+When the source schema has a concentration column (e.g., concentration_um) alongside a
+response column (e.g., raw_value), the data is a dilution series — multiple rows per
+(scientist, compound_id) form ONE dose-response curve.
+
+MANDATORY when concentration column detected:
+1. Group by (scientist_key, compound_id) — do NOT output one row per well
+2. For each group, NORMALIZE raw values using plate control wells (if well_type column present):
+
+     sorted_group = group.sort_values('concentration_um')
+
+     # Separate controls from samples
+     if 'well_type' in sorted_group.columns:
+         neg_ctrls = sorted_group[sorted_group['well_type'] == 'neg_ctrl']['raw_value']
+         pos_ctrls = sorted_group[sorted_group['well_type'] == 'pos_ctrl']['raw_value']
+         samples   = sorted_group[sorted_group['well_type'] == 'sample'].copy()
+         if len(neg_ctrls) > 0 and len(pos_ctrls) > 0:
+             neg_ctrl_mean_val = float(neg_ctrls.mean())
+             pos_ctrl_mean_val = float(pos_ctrls.mean())
+             norm_window = neg_ctrl_mean_val - pos_ctrl_mean_val
+             if norm_window > 0:
+                 samples['normalized_response'] = (
+                     (neg_ctrl_mean_val - samples['raw_value']) / norm_window * 100
+                 ).clip(0, 100)
+             else:
+                 samples['normalized_response'] = samples['raw_value']
+         else:
+             neg_ctrl_mean_val = pos_ctrl_mean_val = None
+             samples['normalized_response'] = samples['raw_value']
+     else:
+         samples = sorted_group.copy()
+         samples['normalized_response'] = samples['raw_value']
+         neg_ctrl_mean_val = pos_ctrl_mean_val = None
+
+     samples = samples.sort_values('concentration_um')
+     concs     = samples['concentration_um'].values.astype(float)
+     responses = samples['normalized_response'].values.astype(float)
+
+3. Fit the Hill equation on the NORMALIZED responses (not raw_value):
+
+     def hill(c, ec50, hill_slope, emax):
+         return emax / (1.0 + (ec50 / np.maximum(c, 1e-12)) ** hill_slope)
+
+     try:
+         popt, _ = curve_fit(hill, concs, responses, p0=[1.0, 1.5, 100.0],
+                             bounds=([1e-6, 0.1, 10.0], [1e6, 5.0, 150.0]),
+                             maxfev=5000)
+         ec50_val, hs_val, emax_val = popt
+         pred      = hill(concs, *popt)
+         residuals = responses - pred
+         ss_res    = np.sum(residuals ** 2)
+         ss_tot    = np.sum((responses - np.mean(responses)) ** 2)
+         r_sq      = float(1 - ss_res / ss_tot) if ss_tot > 1e-10 else 0.0
+         resid_std = float(np.std(residuals)) if len(residuals) > 2 else 1.0
+     except Exception:
+         ec50_val, hs_val, emax_val, r_sq = 1.0, 1.0, 100.0, 0.0
+         residuals = np.zeros(len(concs))
+         resid_std = 1.0
+
+4. Classify each sample point (for curve_data — store as Python list, NOT json.dumps):
+     curve_data = []
+     for j in range(len(concs)):
+         ar = abs(residuals[j])
+         pt_q = 'critical' if ar > 3*resid_std else ('masked' if ar > 2*resid_std else 'valid')
+         curve_data.append({'well_position': str(samples.iloc[j]['well_position']),
+                            'conc_um': float(concs[j]),
+                            'response': float(responses[j]),
+                            'quality': pt_q})
+
+5. Classify curve quality:
+     curve_quality = ('excellent' if r_sq >= 0.95 else 'good' if r_sq >= 0.90
+                      else 'fair' if r_sq >= 0.80 else 'poor')
+6. Set risk_level = 'review' if r_sq < 0.90 else 'auto'
+7. OUTPUT ONE ROW PER (scientist, compound) GROUP. Result columns:
+     scientist_name, compound_id, ec50_um (=ec50_val), hill_slope (=hs_val),
+     r_squared (=r_sq), curve_quality, signal (=emax_val — top of curve),
+     assay_type, num_concentration_points (=len(samples)),
+     source_experiment_id (=str(samples['id'].min())),
+     plate_barcode (=str(samples.iloc[0]['plate_barcode'])),
+     neg_ctrl_mean (=neg_ctrl_mean_val — None if no controls),
+     pos_ctrl_mean (=pos_ctrl_mean_val — None if no controls),
+     curve_data (=the Python list from step 4)
+
+ANOMALY DETECTION (fallback — use when there is NO concentration column):
 - Identify the primary numeric measurement column from your schema analysis
 - Apply mean ± 2σ threshold on that column
   mean = result['<numeric_col>'].mean()
@@ -403,21 +488,31 @@ CRITICAL rules:
     "column_map": {
       "signal": "signal",
       "user_id": "gds_user_id",
-      "well_position": "well_position",
-      "source_experiment_id": "source_experiment_id"
+      "compound_id": "compound_id",
+      "ec50_um": "ec50_um",
+      "hill_slope": "hill_slope",
+      "r_squared": "r_squared",
+      "curve_quality": "curve_quality",
+      "num_concentration_points": "num_concentration_points",
+      "assay_type": "assay_type",
+      "source_experiment_id": "source_experiment_id",
+      "plate_barcode": "plate_barcode",
+      "curve_data": "curve_data",
+      "neg_ctrl_mean": "neg_ctrl_mean",
+      "pos_ctrl_mean": "pos_ctrl_mean"
     },
     "fk_column": "<FK column name in target records table>",
-    "upsert_keys": ["gds_user_id", "well_position"]
+    "upsert_keys": ["gds_user_id", "compound_id"]
   },
   "anomaly_thresholds": {
-    "<your_result_col>": {"low": <float>, "high": <float>, "method": "mean_2sigma"}
+    "r_squared": {"low": 0.0, "high": 0.9, "method": "threshold"}
   }
 }
 
 NOTE: In the example above:
-- upsert_keys is ["gds_user_id", "well_position"] — ONLY the columns in the actual UNIQUE constraint
+- upsert_keys is ["gds_user_id", "compound_id"] — matches the UNIQUE(gds_user_id, compound_id) constraint
 - column_map INCLUDES source_experiment_id for traceability, but it's NOT in upsert_keys
-- This works because the target table has a UNIQUE(gds_user_id, well_position) constraint
+- For dose-response data: one row per (scientist, compound), NOT one row per well
 - Do NOT include infrastructure columns (source_experiment_id, trace_id, approved_by) in upsert_keys
 
 After store_promotion_config succeeds, provide a final summary and stop.
